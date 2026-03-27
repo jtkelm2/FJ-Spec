@@ -677,27 +677,37 @@ def _resolve_card(
 ) -> GameState:
     """
     Resolve a single card by its type(s).
-    Dual-typed cards process all types.
-
-    On Resolve effects are NOT fired yet (Stage 8).
-    Default type processing uses combat module for enemies.
+    
+    Order:
+      1. Fire ON_RESOLVE effects (before default processing)
+      2. Default type processing (combat, eat, wield, equip, discard)
+      3. Fire ON_RESOLVE_AFTER effects
+      4. For enemies: fire ON_KILL and AFTER_DEATH if killed
     """
+    from ..effects import fire_on_resolve, fire_on_resolve_after, fire_on_kill, fire_after_death
     from ..combat import resolve_combat, get_attack_options, apply_damage, apply_healing
 
-    # Determine type processing order
-    # Enemy-like: combat
-    if is_enemy_like(cd):
-        state = _resolve_enemy(state, ctx, resolver, card_id, cd)
+    # 1. Fire ON_RESOLVE effects
+    state = fire_on_resolve(state, card_id, resolver)
+
+    ps = gs_get_player(state, resolver)
+    if ps.is_dead:
         return state
 
-    # For non-enemy cards, process by type
+    # 2. Default type processing
+    if is_enemy_like(cd):
+        state = _resolve_enemy(state, ctx, resolver, card_id, cd)
+        # ON_RESOLVE_AFTER fires after combat
+        state = fire_on_resolve_after(state, card_id, resolver)
+        # ON_KILL and AFTER_DEATH handled inside _resolve_enemy
+        return state
+
     processed = False
 
     # Event component (fires first for dual-types like Chariot)
     if is_event(cd):
-        # Stage 8 will fire ON_RESOLVE handlers
-        # For now, just discard pure events
         if not is_equipment(cd):
+            # Pure event: discard after ON_RESOLVE
             ps = gs_get_player(state, resolver)
             ps = replace(ps, discard_pile=ps.discard_pile + (card_id,))
             state = gs_update_player(state, resolver, ps)
@@ -708,24 +718,26 @@ def _resolve_card(
         state = _resolve_food(state, resolver, card_id, cd)
         processed = True
 
-    # Equipment component (including dual Event+Equipment like Chariot)
+    # Equipment (not weapon, not food)
     if is_equipment(cd) and not is_weapon(cd) and not processed:
         state = _resolve_equipment(state, resolver, card_id, cd)
         processed = True
     elif is_equipment(cd) and is_event(cd) and not processed:
-        # Event+Equipment: event part handled, now equip
         state = _resolve_equipment(state, resolver, card_id, cd)
         processed = True
 
-    # Weapon component (pure weapon, not Equipment+Weapon like Judgement)
+    # Pure weapon
     if is_weapon(cd) and not is_equipment(cd) and not processed:
         state = _resolve_weapon(state, resolver, card_id, cd)
         processed = True
 
-    # Equipment+Weapon (e.g., Judgement, Strength): equip by default
+    # Equipment+Weapon (Judgement, Strength): equip by default
     if is_equipment(cd) and is_weapon(cd) and not processed:
         state = _resolve_equipment(state, resolver, card_id, cd)
         processed = True
+
+    # 3. Fire ON_RESOLVE_AFTER
+    state = fire_on_resolve_after(state, card_id, resolver)
 
     return state
 
@@ -736,14 +748,11 @@ def _resolve_enemy(
 ) -> GameState:
     """
     Combat resolution using the combat module.
-
-    For now, auto-selects attack mode:
-      - Use weapon if available and legal (dulling check passes)
-      - Otherwise use fists
-
-    Stage 8 will present CHOOSE_ATTACK_MODE decision to the player.
+    Fires ON_KILL and AFTER_DEATH triggers after successful kill.
+    Auto-selects attack mode (prefers weapon over fists).
     """
     from ..combat import resolve_combat, get_attack_options
+    from ..effects import fire_on_kill, fire_after_death
 
     options = get_attack_options(state, resolver, card_id)
 
@@ -757,6 +766,16 @@ def _resolve_enemy(
             break
 
     state = resolve_combat(state, resolver, card_id, mode, slot_idx)
+
+    ps = gs_get_player(state, resolver)
+    if not ps.is_dead:
+        # Enemy was killed — fire triggers
+        state = fire_on_kill(state, card_id, resolver)
+
+        # AFTER_DEATH for bosses — grants permanent ability
+        if CardType.BOSS in cd.card_types:
+            state = fire_after_death(state, card_id, resolver)
+
     return state
 
 

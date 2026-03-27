@@ -596,8 +596,8 @@ def test_combat_through_action_phase():
     # Equip a weapon
     state, weapon_id = equip_weapon(state, pid, "weapon_6")
 
-    # Place a level-3 enemy on action field slot 0
-    enemy_id = find_card_in_deck(state, pid, "enemy_3")
+    # Place a level-2 enemy (plain, no ON_KILL effects) on action field slot 0
+    enemy_id = find_card_in_deck(state, pid, "enemy_2")
     assert enemy_id is not None
     ps = gs_get_player(state, pid)
     deck_list = list(ps.deck)
