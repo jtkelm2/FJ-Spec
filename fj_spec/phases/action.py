@@ -679,29 +679,53 @@ def _resolve_card(
     Resolve a single card by its type(s).
     Dual-typed cards process all types.
 
-    For now, On Resolve effects are NOT fired (Stage 8).
-    Only default type processing occurs.
+    On Resolve effects are NOT fired yet (Stage 8).
+    Default type processing uses combat module for enemies.
     """
-    # Process each type in the card
+    from ..combat import resolve_combat, get_attack_options, apply_damage, apply_healing
+
+    # Determine type processing order
+    # Enemy-like: combat
     if is_enemy_like(cd):
         state = _resolve_enemy(state, ctx, resolver, card_id, cd)
-    if is_food(cd) and not is_enemy_like(cd):
-        state = _resolve_food(state, resolver, card_id, cd)
-    if is_weapon(cd) and not is_enemy_like(cd):
-        state = _resolve_weapon(state, resolver, card_id, cd)
-    if is_equipment(cd) and not is_weapon(cd) and not is_food(cd):
-        state = _resolve_equipment(state, resolver, card_id, cd)
-    if is_event(cd) and not is_equipment(cd):
-        state = _resolve_event(state, resolver, card_id, cd)
+        return state
 
-    # For dual-typed cards: handle combinations
-    # Event+Equipment (e.g., Chariot): event effect already applied, then equip
-    if is_event(cd) and is_equipment(cd):
-        state = _resolve_event(state, resolver, card_id, cd)
+    # For non-enemy cards, process by type
+    processed = False
+
+    # Event component (fires first for dual-types like Chariot)
+    if is_event(cd):
+        # Stage 8 will fire ON_RESOLVE handlers
+        # For now, just discard pure events
+        if not is_equipment(cd):
+            ps = gs_get_player(state, resolver)
+            ps = replace(ps, discard_pile=ps.discard_pile + (card_id,))
+            state = gs_update_player(state, resolver, ps)
+            processed = True
+
+    # Food component
+    if is_food(cd) and not processed:
+        state = _resolve_food(state, resolver, card_id, cd)
+        processed = True
+
+    # Equipment component (including dual Event+Equipment like Chariot)
+    if is_equipment(cd) and not is_weapon(cd) and not processed:
         state = _resolve_equipment(state, resolver, card_id, cd)
-    # Equipment+Weapon (e.g., Judgement, Strength): equip (not wield by default)
-    if is_equipment(cd) and is_weapon(cd):
+        processed = True
+    elif is_equipment(cd) and is_event(cd) and not processed:
+        # Event+Equipment: event part handled, now equip
         state = _resolve_equipment(state, resolver, card_id, cd)
+        processed = True
+
+    # Weapon component (pure weapon, not Equipment+Weapon like Judgement)
+    if is_weapon(cd) and not is_equipment(cd) and not processed:
+        state = _resolve_weapon(state, resolver, card_id, cd)
+        processed = True
+
+    # Equipment+Weapon (e.g., Judgement, Strength): equip by default
+    if is_equipment(cd) and is_weapon(cd) and not processed:
+        state = _resolve_equipment(state, resolver, card_id, cd)
+        processed = True
 
     return state
 
@@ -711,24 +735,28 @@ def _resolve_enemy(
     resolver: PlayerId, card_id: CardId, cd: CardDef
 ) -> GameState:
     """
-    Combat resolution stub.
+    Combat resolution using the combat module.
 
-    Stage 7 will implement the full damage pipeline with attack mode choice.
-    For now: auto-fight with fists, take damage = enemy level, discard enemy.
+    For now, auto-selects attack mode:
+      - Use weapon if available and legal (dulling check passes)
+      - Otherwise use fists
+
+    Stage 8 will present CHOOSE_ATTACK_MODE decision to the player.
     """
-    ps = gs_get_player(state, resolver)
-    enemy_level = cd.level or 0
+    from ..combat import resolve_combat, get_attack_options
 
-    # Stub: fight with fists, take full damage
-    new_hp = ps.hp - enemy_level
-    if new_hp <= 0:
-        ps = ps_set_dead(ps)
-    else:
-        ps = ps_set_hp(ps, new_hp)
+    options = get_attack_options(state, resolver, card_id)
 
-    # Discard enemy (fists → discard, not kill pile)
-    ps = replace(ps, discard_pile=ps.discard_pile + (card_id,))
-    state = gs_update_player(state, resolver, ps)
+    # Auto-select: prefer weapon over fists
+    mode = "fists"
+    slot_idx = 0
+    for opt_mode, opt_idx in options:
+        if opt_mode != "fists":
+            mode = "weapon"
+            slot_idx = opt_idx
+            break
+
+    state = resolve_combat(state, resolver, card_id, mode, slot_idx)
     return state
 
 
@@ -737,15 +765,19 @@ def _resolve_food(
     card_id: CardId, cd: CardDef
 ) -> GameState:
     """Resolve a food card: eat for healing if not eaten this phase."""
+    from ..combat import apply_healing, HealSource
+
     ps = gs_get_player(state, resolver)
 
     if not ps.has_eaten_this_phase and cd.level is not None:
         # Eat: heal for food's level
-        new_hp = min(ps.hp + cd.level, ps.hp_cap)
-        ps = ps_set_hp(ps, new_hp)
-        ps = ps_set_eaten(ps, True)
+        state = apply_healing(state, resolver, cd.level, HealSource.FOOD)
+        ps = gs_get_player(state, resolver)
+        ps = replace(ps, has_eaten_this_phase=True)
+        state = gs_update_player(state, resolver, ps)
 
     # Discard food
+    ps = gs_get_player(state, resolver)
     ps = replace(ps, discard_pile=ps.discard_pile + (card_id,))
     state = gs_update_player(state, resolver, ps)
     return state
