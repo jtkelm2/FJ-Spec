@@ -57,6 +57,19 @@ def run_refresh_to_completion(state: GameState) -> GameState:
     raise RuntimeError("Refresh phase did not complete in 50 iterations")
 
 
+def run_refresh_until_decision(state: GameState) -> GameState:
+    """Run the refresh phase until a pending decision or phase transition."""
+    assert state.phase == Phase.REFRESH
+    from fj_spec.phases.refresh import advance_refresh
+    for _ in range(50):
+        if state.phase != Phase.REFRESH:
+            return state
+        if state.pending is not None:
+            return state
+        state = advance_refresh(state)
+    raise RuntimeError("Refresh phase did not produce a decision in 50 iterations")
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -329,38 +342,26 @@ def test_cardsharp_decision():
                 has_cs = True
                 break
 
-        if not has_cs:
-            continue
+        assert has_cs
 
-        # Run refresh until we hit a decision
-        state = auto_advance(state)
+        # Run refresh until we hit a decision (use refresh-only stepper)
+        state = run_refresh_until_decision(state)
 
-        if state.pending is not None:
-            assert state.pending.kind == DecisionKind.REARRANGE_ACTION_FIELD
-            cs_player = state.pending.player
-            assert player_is_cardsharp(state, cs_player)
-            assert len(state.pending.legal_actions) == 24  # 4! permutations
+        assert state.pending is not None
+        assert state.pending.kind == DecisionKind.REARRANGE_ACTION_FIELD
+        cs_player = state.pending.player
+        assert player_is_cardsharp(state, cs_player)
+        assert len(state.pending.legal_actions) == 24  # 4! permutations
 
-            # Apply identity permutation (no change)
-            identity = Action(kind=ActionKind.SELECT_PERMUTATION,
-                              permutation=(0, 1, 2, 3))
-            state = apply(state, identity)
+        print(f"  Found Cardsharp at seed={seed}, decision presented with 24 options")
+        break
 
-            # Should either get another Cardsharp decision or finish
-            if state.pending is not None:
-                assert state.pending.kind == DecisionKind.REARRANGE_ACTION_FIELD
-                state = apply(state, identity)
-
-            found = True
-            print(f"  Found Cardsharp at seed={seed}, decision presented with 24 options")
-            break
-
-    assert found, "Should find Cardsharp in 100 seeds"
     print("  PASS")
 
 
 def test_cardsharp_rearrange_effect():
     print("Testing Cardsharp rearrangement actually moves cards...")
+    from fj_spec.phases.refresh import advance_refresh, apply_refresh_action
     for seed in range(100):
         state = create_initial_state(
             seed=seed,
@@ -368,7 +369,7 @@ def test_cardsharp_rearrange_effect():
             evil_pool=["bad_role_1"],
         )
 
-        state = auto_advance(state)
+        state = run_refresh_until_decision(state)
         if state.pending is None or state.pending.kind != DecisionKind.REARRANGE_ACTION_FIELD:
             continue
 
@@ -379,16 +380,14 @@ def test_cardsharp_rearrange_effect():
         # Record contents before rearrangement
         old_contents = [slot.cards for slot in old_slots]
 
-        # Apply a swap: move slot 0 to position 2, slot 2 to position 0
-        # Permutation (2, 1, 0, 3): slot 0→pos 2, slot 1→pos 1, slot 2→pos 0, slot 3→pos 3
+        # Apply a swap: move slot 0→pos 2, slot 2→pos 0
         swap_perm = Action(kind=ActionKind.SELECT_PERMUTATION,
                            permutation=(2, 1, 0, 3))
-        state = apply(state, swap_perm)
+        state = gs_set_pending(state, None)
+        state = apply_refresh_action(state, swap_perm)
 
-        # Handle potential second Cardsharp decision
-        if state.pending is not None and state.pending.kind == DecisionKind.REARRANGE_ACTION_FIELD:
-            state = apply(state, Action(kind=ActionKind.SELECT_PERMUTATION,
-                                        permutation=(0, 1, 2, 3)))
+        # Continue refresh to completion (handles second Cardsharp if any)
+        state = run_refresh_to_completion(state)
 
         # Verify the swap happened
         new_af = state.action_field
