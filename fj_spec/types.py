@@ -259,21 +259,25 @@ class RefreshContext:
 
 
 class ManipStep(Enum):
-    CHOOSE = auto()          # Each player choosing manipulate or dump
-    SWAPPING = auto()        # Players swapping / dumping
-    DEALING = auto()         # Post-choice automated dealing
-    FORCE_CHOOSE = auto()    # If forcing, choose which card to send
+    CHOOSE = auto()            # Players choosing manipulate or dump
+    SWAP_OR_DUMP = auto()      # Current player doing swaps (manipulate) or choosing fates (dump)
+    FORCE_OFFER = auto()       # Current player offered chance to force (manipulate only)
+    DEALING = auto()           # Automated: draw third card, shuffle
+    FORCE_CARD_CHOOSE = auto() # Forcing player chooses which card to send
     DONE = auto()
 
 
 @dataclass(frozen=True)
 class ManipulationContext:
     step: ManipStep = ManipStep.CHOOSE
+    current_player: PlayerId | None = None  # Who is currently being prompted
     red_choice: ManipChoice | None = None
     blue_choice: ManipChoice | None = None
-    red_done_swapping: bool = False
-    blue_done_swapping: bool = False
-    forcing: tuple[CardId | None, CardId | None] = (None, None)  # Per player
+    red_done: bool = False  # Finished swapping/dumping
+    blue_done: bool = False
+    red_forcing: CardId | None = None   # Equipment card flipped for forcing
+    blue_forcing: CardId | None = None
+    dealing_player: PlayerId | None = None  # Which player's dealing is being processed
 
 
 @dataclass(frozen=True)
