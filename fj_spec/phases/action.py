@@ -652,7 +652,24 @@ def _step_resolving_slot(state: GameState, ctx: ActionContext) -> GameState:
     ps = gs_get_player(state, pid)
     if ps.is_dead:
         ctx_new = state.phase_context
-        if isinstance(ctx_new, ActionContext):
+        if isinstance(ctx_new, ActionContext) and ctx_new.resolving:
+            # Return unresolved cards to the action field slot they came from
+            res = ctx_new.resolving
+            orphans: list[CardId] = []
+            # The current card: if it's an enemy and the player died, the enemy survives
+            # Check if the card was already placed somewhere by _resolve_card
+            if res.current_card is not None and not _card_is_placed(state, pid, res.current_card):
+                orphans.append(res.current_card)
+            # Remaining queue cards
+            for qc in res.card_queue:
+                if not _card_is_placed(state, pid, qc):
+                    orphans.append(qc)
+            if orphans:
+                af = state.action_field
+                for orphan_id in orphans:
+                    af = af_add_card_to_slot(af, res.slot_owner, res.slot_index,
+                                             orphan_id, position="bottom")
+                state = gs_set_action_field(state, af)
             ctx_new = replace(ctx_new, resolving=None, step=ActionStep.NEXT_TURN)
             return gs_set_context(state, ctx_new)
         return state
@@ -694,12 +711,21 @@ def _resolve_card(
     if ps.is_dead:
         return state
 
+    # Check if ON_RESOLVE already placed the card somewhere (e.g., equipped it)
+    # If so, skip default type processing
+    card_already_placed = _card_is_placed(state, resolver, card_id)
+
     # 2. Default type processing
     if is_enemy_like(cd):
         state = _resolve_enemy(state, ctx, resolver, card_id, cd)
         # ON_RESOLVE_AFTER fires after combat
         state = fire_on_resolve_after(state, card_id, resolver)
         # ON_KILL and AFTER_DEATH handled inside _resolve_enemy
+        return state
+
+    if card_already_placed:
+        # ON_RESOLVE handler already dealt with this card — skip defaults
+        state = fire_on_resolve_after(state, card_id, resolver)
         return state
 
     processed = False
@@ -1191,3 +1217,24 @@ def _disarm_player(state: GameState, pid: PlayerId) -> GameState:
                  discard_pile=ps.discard_pile + tuple(discard_cards))
     state = gs_update_player(state, pid, ps)
     return state
+
+
+# ---------------------------------------------------------------------------
+# Card placement check
+# ---------------------------------------------------------------------------
+
+def _card_is_placed(state: GameState, pid: PlayerId, card_id: CardId) -> bool:
+    """Check if a card has already been placed in equipment, weapon, or discard/refresh."""
+    ps = gs_get_player(state, pid)
+    if card_id in ps.equipment:
+        return True
+    for ws in ps.weapon_slots:
+        if ws.weapon == card_id:
+            return True
+        if card_id in ws.kill_pile:
+            return True
+    if card_id in ps.discard_pile:
+        return True
+    if card_id in ps.refresh_pile:
+        return True
+    return False
