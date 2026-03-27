@@ -400,18 +400,25 @@ def test_engine_auto_advance_stubs():
         empty = af_find_empty_slots(af, pid)
         assert len(empty) == 1, f"{pid.name} should have 1 empty slot, got {len(empty)}"
 
-    # Verify manipulation stub → action, action stub → refresh
+    # Verify manipulation advances (now presents CHOOSE decision, not auto-transition)
     from fj_spec.phases.manipulation import advance_manipulation
     s2 = advance_manipulation(s)
-    assert s2.phase == Phase.ACTION
+    # Should still be in MANIPULATION phase but with a pending decision
+    assert s2.phase == Phase.MANIPULATION
+    assert s2.pending is not None
+    assert s2.pending.kind == DecisionKind.CHOOSE_MANIPULATE_OR_DUMP
 
+    # Verify action phase now presents decisions (no longer a stub)
     from fj_spec.phases.action import advance_action
-    s3 = advance_action(s2)
-    assert s3.phase == Phase.REFRESH
-    assert s3.turn_number == 2
+    from fj_spec.state_helpers import gs_set_phase
+    s_action = gs_set_phase(s, Phase.ACTION, ActionContext(current_turn=s.priority))
+    s3 = advance_action(s_action)
+    # Action phase should present a LAST_RESORT_OFFER or CHOOSE_SLOT decision
+    assert s3.phase == Phase.ACTION
+    assert s3.pending is not None
 
     print(f"  Refresh steps: {' → '.join(steps_seen)}")
-    print("  Phase cycle: REFRESH → MANIPULATION → ACTION → REFRESH (turn 2)")
+    print("  Phase transitions verified: REFRESH → MANIPULATION, ACTION presents decisions")
     print("  PASS")
 
 

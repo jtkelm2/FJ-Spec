@@ -280,21 +280,21 @@ class ManipulationContext:
     dealing_player: PlayerId | None = None  # Which player's dealing is being processed
 
 
-@dataclass(frozen=True)
-class RunningContext:
-    """Sub-state while Running last resort is in progress."""
-    runner: PlayerId = PlayerId.RED
-    drawn_cards: tuple[CardId, ...] = ()     # 4 cards the other player sees
-    recycle_decisions: tuple[bool, ...] = ()  # Per-card: True = recycled
-    step: str = "PREP"  # PREP, DECIDING, SHUFFLING, DONE
-
-
-@dataclass(frozen=True)
-class HierophantContext:
-    """Sub-state for Hierophant's discard effect."""
-    owner: PlayerId = PlayerId.RED
-    hand_cards: tuple[CardId, ...] = ()  # The 6-card hand to split
-    step: str = "DRAWING"  # DRAWING, SPLITTING, PLACING, DONE
+class ActionStep(Enum):
+    """Sub-steps within the Action Phase."""
+    LAST_RESORT_OFFER = auto()   # Offer last resort before first play
+    CHOOSE_SLOT = auto()         # Active player chooses a slot
+    CONSENT_CHECK = auto()       # Other player grants/denies consent
+    RESOLVING_SLOT = auto()      # Processing cards in a slot
+    VOLUNTARY_DISCARD = auto()   # Between-card discard window
+    RESOLVE_FROM_DECK = auto()   # No legal slots → resolve from deck
+    NEXT_TURN = auto()           # Switch to next player's turn
+    ELUSIVE_CLEANUP = auto()     # End-of-phase Elusive refresh
+    RUNNING_PREP = auto()        # Running sub-phase: other player draws 4
+    RUNNING_DECIDE = auto()      # Running sub-phase: recycling decisions
+    RUNNING_DEAL = auto()        # Running sub-phase: shuffle and deal
+    GUARDS = auto()              # Calling the guards
+    DONE = auto()
 
 
 @dataclass(frozen=True)
@@ -305,11 +305,27 @@ class ResolutionContext:
     card_queue: tuple[CardId, ...] = ()       # Remaining cards in slot to resolve
     current_card: CardId | None = None
     sub_resolution: ResolutionContext | None = None  # For Fool/Magician nested resolves
-    voluntary_discard_window: bool = False
+
+
+@dataclass(frozen=True)
+class RunningContext:
+    """Sub-state while Running last resort is in progress."""
+    runner: PlayerId = PlayerId.RED
+    drawn_cards: tuple[CardId, ...] = ()     # 4 cards the other player sees
+    replacement_cards: tuple[CardId, ...] = ()  # Cards drawn as replacements
+
+
+@dataclass(frozen=True)
+class ConsentRequest:
+    """Pending consent request for resolving another player's slot."""
+    requester: PlayerId = PlayerId.RED
+    slot_owner: PlayerId = PlayerId.BLUE
+    slot_index: int = 0
 
 
 @dataclass(frozen=True)
 class ActionContext:
+    step: ActionStep = ActionStep.LAST_RESORT_OFFER
     current_turn: PlayerId = PlayerId.RED
     plays_remaining_red: int = 3
     plays_remaining_blue: int = 3
@@ -317,9 +333,12 @@ class ActionContext:
     last_resort_offered_blue: bool = False
     last_resort_used_red: bool = False
     last_resort_used_blue: bool = False
-    running: RunningContext | None = None
-    hierophant: HierophantContext | None = None
     resolving: ResolutionContext | None = None
+    running: RunningContext | None = None
+    consent_request: ConsentRequest | None = None
+    # Track consumed plays per turn for alternation
+    red_eaten_this_phase: bool = False
+    blue_eaten_this_phase: bool = False
 
 
 # Union type for phase context
