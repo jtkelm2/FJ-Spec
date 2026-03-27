@@ -242,19 +242,20 @@ class SetupContext:
 
 
 class RefreshStep(Enum):
-    SHUFFLE_REFRESH = auto()
-    DEAL_HAND = auto()
-    DEAL_ACTIONS = auto()
-    DEAL_MANIPULATION = auto()
-    FLIP_PRIORITY = auto()
-    PERIODIC_EFFECTS = auto()
-    CARDSHARP_REARRANGE = auto()
-    DONE = auto()
+    MOON_RECORD = auto()         # Record HP for Moon deviation cap
+    SHUFFLE_REFRESH = auto()     # Shuffle refresh pile into deck
+    DEAL_ALL = auto()            # Deal hand, actions, manipulation (all deterministic)
+    FLIP_PRIORITY = auto()       # Flip the priority tracker
+    CARDSHARP_REARRANGE = auto() # Cardsharp decision point (if applicable)
+    PERIODIC_EFFECTS = auto()    # End-of-phase periodic effects
+    DONE = auto()                # Transition to Manipulation
 
 
 @dataclass(frozen=True)
 class RefreshContext:
-    step: RefreshStep = RefreshStep.SHUFFLE_REFRESH
+    step: RefreshStep = RefreshStep.MOON_RECORD
+    cardsharp_player: PlayerId | None = None  # Which Cardsharp is pending decision
+    moon_recorded_hp: tuple[int, int] = (0, 0)  # HP recorded for Moon deviation (RED, BLUE)
 
 
 class ManipStep(Enum):
