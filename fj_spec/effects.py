@@ -310,6 +310,7 @@ def _pinata_stick_resume(state, ectx, action):
     resolver = ectx.resolver
     if action.flag:
         other = resolver.other()
+        # TODO: card says "deal 3 damage to the OTHER player", not self
         state = apply_damage(state, resolver, 3, DamageSource.SELF_INFLICTED)
         # In a real UI, the hand would be revealed. In our debug CLI, it's always visible.
     return state
@@ -503,8 +504,8 @@ def _high_priestess_resume(state, ectx, action):
 
     # For each match: choose heal 7, deal 7, or force discard equipment
     for _ in range(matches):
-        # For now, auto-choose heal 7 (presenting a decision for each match
-        # would require multiple sequential effect decisions — we simplify)
+        # TODO: present three-way choice per match: heal 7 / deal 7 to other / force other to
+        # discard a piece of equipment (or confirm they have none). Currently auto-heals 7.
         state = apply_healing(state, resolver, 7, HealSource.CARD_EFFECT)
 
     return state
@@ -544,7 +545,7 @@ def _hermit_resume(state, ectx, action):
         # Choose which equipment to discard (if any)
         equip_ids = [eq for eq in ps.equipment if eq is not None and eq != ps.role_card_id]
         if equip_ids:
-            # Discard the first non-role equipment
+            # TODO: present a choice of which equipment to discard; currently auto-discards first
             state = _discard_equipment_by_id(state, resolver, equip_ids[0])
         rng, roll = rng_d10(rng)
         state = gs_with_rng_result(state, rng)
@@ -653,6 +654,8 @@ def _tower_die(state, card_id, resolver):
 
 
 def _moon_deviation_cap(state, card_id, resolver):
+    # TODO: ability is registered but _get_moon_recorded_hp in combat.py always returns None;
+    # recorded HP must be persisted at Refresh Phase start and carried through Action Phase.
     ps = gs_get_player(state, resolver)
     ps = ps_add_permanent_ability(ps, "moon_deviation_cap")
     return gs_update_player(state, resolver, ps)
@@ -701,6 +704,7 @@ def _lovers_resume(state, ectx, action):
 
 
 def _judgement_wield_option(state, card_id, resolver):
+    # TODO: present decision to discard this from equipment and wield it as a weapon
     return state
 
 
@@ -719,6 +723,7 @@ def _judgement_single_use(state, card_id, resolver):
 
 
 def _strength_wield_option(state, card_id, resolver):
+    # TODO: present decision to discard this from equipment and wield it as a weapon
     return state
 
 
@@ -779,7 +784,8 @@ def _hierophant_discard(state, card_id, resolver):
     from .phases.refresh import _safe_draw
     ps = gs_get_player(state, resolver)
     rng = gs_get_rng(state)
-    # Hierophant draws from the other player's deck (hand cards are from other's deck)
+    # ???: card says "draw until you have 6 cards in hand" — should this draw from resolver's
+    # own deck or from other? Currently draws from other. Verify against rules intent.
     other = resolver.other()
     need = max(0, 6 - len(ps.hand))
     if need > 0:
@@ -876,7 +882,9 @@ def _hierophant_resume(state, ectx, action):
 
 
 def _chariot_prevent(state, card_id, resolver):
-    """major_7: While equipped, may discard to prevent damage. Checked in damage pipeline."""
+    """major_7: While equipped, may discard to prevent damage."""
+    # TODO: not wired into combat.py damage pipeline; requires an interruptible decision
+    # (player chooses to discard Chariot in response to any incoming damage instance)
     return state
 
 
@@ -942,7 +950,9 @@ def _saltine_weapon_eat_resume(state, ectx, action):
 
 
 def _fat_sandwich_eat(state, card_id, resolver):
-    return state  # Handled via voluntary discard options
+    # ???: "While equipped: You may discard this to eat this." The voluntary discard
+    # option during Action Phase needs to be explicitly offered when Fat Sandwich is equipped.
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -1012,7 +1022,6 @@ HANDLER_REGISTRY: dict[str, Any] = {
     "vorpal_blade_discard": _vorpal_blade_discard,
     "pinata_stick": _pinata_stick,
     "fetch_stick_transfer": _fetch_stick_transfer,
-    "weapon_7_no_distance": _noop,
     # Enemies
     "gobshite_fist_check": _gobshite_fist_check,
     "enemy_3_discard_kills": _enemy_3_discard_kills,
@@ -1045,37 +1054,40 @@ HANDLER_REGISTRY: dict[str, Any] = {
     "hierophant_discard": _hierophant_discard,
     # Guards
     "guard_respawn": _guard_respawn,
-    # Structural / no-ops
-    "cardsharp_no_consent_needed": _noop,
-    "food_fighter_swap": _noop,
-    "corruption_invert_healing": _noop,
-    "phoenix_no_give_hp": _noop,
-    "fool_role_redirect": _noop,
-    "survivor_extra_action": _noop,
-    "ocean_counter_mechanic": _noop,
-    "ocean_no_guards": _noop,
-    "detective_no_guards": _noop,
-    "detective_view_deck": _noop,
-    "poet_refresh_enemy": _noop,
-    "poet_weapon_fragile": _noop,
-    "world_role_self_destruct": _noop,
-    "world_role_redirect_kill": _noop,
-    "human_call_guards": _noop,
-    "guard_prevent_run": _noop,
-    "guard_draw_underneath": _noop,
-    "skeleton_draw_underneath": _noop,
-    "mutineer_setup_discard": _noop,
-    "fool_role_setup": _noop,
-    "leo_setup": _noop,
-    "two_armed_freak_setup": _noop,
-    "empress_heal": _noop,
-    "bellyfiller_heal": _noop,
-    "corruption_heal": _noop,
-    "phoenix_tick": _noop,
-    "survivor_counter_damage": _noop,
-    "star_revive": _noop,
-    "leo_revive": _noop,
-    "emperor_weapon_boost": _noop,
+    # --- Structural no-ops: logic lives in another module, handler correctly does nothing ---
+    "cardsharp_no_consent_needed": _noop,   # enforced in action.py player_is_cardsharp check
+    "guard_prevent_run": _noop,             # enforced in action.py _can_run via has_trigger check
+    "guard_draw_underneath": _noop,         # handled in refresh.py _safe_draw
+    "skeleton_draw_underneath": _noop,      # handled in refresh.py _safe_draw
+    "mutineer_setup_discard": _noop,        # handled in setup.py _apply_role_setup
+    "fool_role_setup": _noop,               # handled in setup.py _apply_role_setup
+    "leo_setup": _noop,                     # handled in setup.py _apply_role_setup
+    "two_armed_freak_setup": _noop,         # handled in setup.py _apply_role_setup
+    "empress_heal": _noop,                  # handled in refresh.py _step_periodic_effects
+    "bellyfiller_heal": _noop,              # handled in refresh.py _step_periodic_effects
+    "corruption_heal": _noop,               # handled in refresh.py _step_periodic_effects
+    "phoenix_tick": _noop,                  # handled in refresh.py _step_periodic_effects
+    "survivor_counter_damage": _noop,       # handled in refresh.py _step_periodic_effects
+    "star_revive": _noop,                   # handled in combat.py _apply_lethal_damage
+    "leo_revive": _noop,                    # handled in combat.py _apply_lethal_damage
+    "emperor_weapon_boost": _noop,          # handled in combat.py resolve_combat weapon attack
+
+    # --- TODO: not implemented anywhere ---
+    "weapon_7_no_distance": _noop,          # TODO: distance penalty waiver not applied (see action.py:689); enemy-on-other-field discard also missing
+    "food_fighter_swap": _noop,             # TODO: Foo(d) Fighter swap wield↔eat not enforced at wield/eat call sites
+    "corruption_invert_healing": _noop,     # TODO: apply_healing not wired to check Corruption; only periodic healing is inverted in refresh.py
+    "phoenix_no_give_hp": _noop,            # TODO: Lovers/Hermit/Temperance give-HP paths don't check Phoenix restriction
+    "fool_role_redirect": _noop,            # TODO: The Fool role card should refresh instead of discard, and refresh on weapon discard
+    "survivor_extra_action": _noop,         # TODO: counter-place/resolve-top action not offered in Action Phase
+    "ocean_counter_mechanic": _noop,        # TODO: Ocean counter/guard-spawn mechanic not implemented
+    "ocean_no_guards": _noop,               # TODO: Call Guards last resort not blocked for Ocean role
+    "detective_no_guards": _noop,           # TODO: Call Guards last resort not blocked for Detective role
+    "detective_view_deck": _noop,           # TODO: on discard, offer view of own deck + refresh pile
+    "poet_refresh_enemy": _noop,            # TODO: when fighting non-guard enemy, offer refresh instead
+    "poet_weapon_fragile": _noop,           # TODO: Poet's weapons should discard after first kill
+    "world_role_self_destruct": _noop,      # TODO: player dies if The World boss dies on their action field
+    "world_role_redirect_kill": _noop,      # TODO: while equipped, offer redirect of killed non-guard to other's refresh
+    "human_call_guards": _noop,             # TODO: Human Last Resort is distinct: disarm other player then stack a guard on each of their action slots
 }
 
 RESUME_REGISTRY: dict[str, Any] = {
