@@ -288,13 +288,25 @@ class ActionStep(Enum):
     RESOLVING_SLOT = auto()      # Processing cards in a slot
     VOLUNTARY_DISCARD = auto()   # Between-card discard window
     RESOLVE_FROM_DECK = auto()   # No legal slots → resolve from deck
+    ATTACK_CHOICE = auto()       # Player chooses fists or weapon
+    EFFECT_DECISION = auto()     # Mid-resolution effect needs player input
     NEXT_TURN = auto()           # Switch to next player's turn
     ELUSIVE_CLEANUP = auto()     # End-of-phase Elusive refresh
     RUNNING_PREP = auto()        # Running sub-phase: other player draws 4
     RUNNING_DECIDE = auto()      # Running sub-phase: recycling decisions
     RUNNING_DEAL = auto()        # Running sub-phase: shuffle and deal
     GUARDS = auto()              # Calling the guards
+    MUTINY = auto()              # Mutiny combat
     DONE = auto()
+
+
+@dataclass(frozen=True)
+class EffectContext:
+    """State for a mid-resolution effect that needs player input."""
+    handler: str = ""                       # Which handler to resume
+    card_id: CardId = 0                     # Card that triggered the effect
+    resolver: PlayerId = PlayerId.RED
+    data: dict = field(default_factory=dict)  # Handler-specific state
 
 
 @dataclass(frozen=True)
@@ -305,6 +317,7 @@ class ResolutionContext:
     card_queue: tuple[CardId, ...] = ()       # Remaining cards in slot to resolve
     current_card: CardId | None = None
     sub_resolution: ResolutionContext | None = None  # For Fool/Magician nested resolves
+    on_resolve_done: bool = False  # True if ON_RESOLVE already fired (resuming from effect decision)
 
 
 @dataclass(frozen=True)
@@ -336,6 +349,8 @@ class ActionContext:
     resolving: ResolutionContext | None = None
     running: RunningContext | None = None
     consent_request: ConsentRequest | None = None
+    effect_ctx: EffectContext | None = None     # Mid-resolution effect state
+    attack_target: CardId | None = None          # Enemy being fought (for ATTACK_CHOICE)
     # Track consumed plays per turn for alternation
     red_eaten_this_phase: bool = False
     blue_eaten_this_phase: bool = False

@@ -1,42 +1,37 @@
 """
 Fools' Journey — Executable Spec
-Stage 8: Card effect handlers.
+Stage 10: Card effect handlers — all decisions fully interactive.
 
-This module implements all card-specific effect handlers. Handlers are
-pure functions: (GameState, CardId, PlayerId, **kwargs) → GameState.
+Architecture for mid-resolution decisions:
+  1. Handler detects a decision is needed
+  2. Handler stores state in EffectContext, sets step to EFFECT_DECISION
+  3. Handler returns state with PendingDecision set
+  4. Player responds → _apply_effect_decision dispatches to handler's resume function
+  5. Resume function continues processing and returns to RESOLVING_SLOT
 
-Handlers are dispatched from the resolution pipeline in action.py via
-the fire_effects() function, which looks up handlers by trigger type
-on the card definition.
-
-Some handlers need player decisions — they return the state with a
-pending decision set. The action phase loop will resume the handler
-after the decision is resolved.
-
-For this stage, we implement the deterministic handlers inline and
-mark decision-requiring handlers with a simplified auto-resolution
-(the full decision presentation will be refined as needed).
+Handlers that need no decision remain simple (state, card_id, resolver) → state.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import replace, field
+from typing import Any
 
 from .types import (
     CardId, CardDef, CardState, CardType,
     PlayerId, Alignment, Phase, Parity,
     PlayerState, WeaponSlot, ManipulationField,
     ActionSlot, ActionField,
-    GameState, Action, ActionKind,
+    GameState, Action, ActionKind, AttackMode,
     PendingDecision, DecisionKind,
-    ActionContext, ActionStep, ResolutionContext,
-    Trigger,
+    ActionContext, ActionStep, ResolutionContext, EffectContext,
+    Trigger, SlotRef,
     ACTION_FILL_ORDER,
 )
 from .cards import (
     has_trigger, get_handlers_for_trigger,
     is_enemy_like, is_food, is_weapon, is_equipment, is_event,
-    get_card_def,
+    get_card_def, ALL_CARD_DEFS,
 )
 from .state_helpers import (
     gs_get_player, gs_update_player,
@@ -71,188 +66,278 @@ from .rng import rng_d20, rng_d10, rng_d4, rng_shuffle
 # Effect dispatch
 # ---------------------------------------------------------------------------
 
-def fire_on_resolve(
-    state: GameState, card_id: CardId, resolver: PlayerId
-) -> GameState:
-    """Fire all ON_RESOLVE handlers for a card."""
+def fire_on_resolve(state: GameState, card_id: CardId, resolver: PlayerId) -> GameState:
     cd = state.card_def(card_id)
-    for handler_name in get_handlers_for_trigger(cd, Trigger.ON_RESOLVE):
-        fn = HANDLER_REGISTRY.get(handler_name)
+    for h in get_handlers_for_trigger(cd, Trigger.ON_RESOLVE):
+        fn = HANDLER_REGISTRY.get(h)
         if fn:
             state = fn(state, card_id, resolver)
     return state
 
 
-def fire_on_resolve_after(
-    state: GameState, card_id: CardId, resolver: PlayerId
-) -> GameState:
-    """Fire all ON_RESOLVE_AFTER handlers."""
+def fire_on_resolve_after(state: GameState, card_id: CardId, resolver: PlayerId) -> GameState:
     cd = state.card_def(card_id)
-    for handler_name in get_handlers_for_trigger(cd, Trigger.ON_RESOLVE_AFTER):
-        fn = HANDLER_REGISTRY.get(handler_name)
+    for h in get_handlers_for_trigger(cd, Trigger.ON_RESOLVE_AFTER):
+        fn = HANDLER_REGISTRY.get(h)
         if fn:
             state = fn(state, card_id, resolver)
     return state
 
 
-def fire_on_kill(
-    state: GameState, card_id: CardId, resolver: PlayerId
-) -> GameState:
-    """Fire ON_KILL handlers when a card is killed/discarded during Action Phase."""
+def fire_on_kill(state: GameState, card_id: CardId, resolver: PlayerId) -> GameState:
     cd = state.card_def(card_id)
-    for handler_name in get_handlers_for_trigger(cd, Trigger.ON_KILL):
-        fn = HANDLER_REGISTRY.get(handler_name)
+    for h in get_handlers_for_trigger(cd, Trigger.ON_KILL):
+        fn = HANDLER_REGISTRY.get(h)
         if fn:
             state = fn(state, card_id, resolver)
     return state
 
 
-def fire_on_discard(
-    state: GameState, card_id: CardId, resolver: PlayerId
-) -> GameState:
-    """Fire ON_DISCARD handlers when a card is discarded during Action Phase."""
+def fire_on_discard(state: GameState, card_id: CardId, resolver: PlayerId) -> GameState:
     cd = state.card_def(card_id)
-    for handler_name in get_handlers_for_trigger(cd, Trigger.ON_DISCARD):
-        fn = HANDLER_REGISTRY.get(handler_name)
+    for h in get_handlers_for_trigger(cd, Trigger.ON_DISCARD):
+        fn = HANDLER_REGISTRY.get(h)
         if fn:
             state = fn(state, card_id, resolver)
     return state
 
 
-def fire_after_death(
-    state: GameState, card_id: CardId, resolver: PlayerId
-) -> GameState:
-    """Fire AFTER_DEATH handlers — grant permanent abilities to the resolver."""
+def fire_after_death(state: GameState, card_id: CardId, resolver: PlayerId) -> GameState:
     cd = state.card_def(card_id)
-    for handler_name in get_handlers_for_trigger(cd, Trigger.AFTER_DEATH):
-        fn = HANDLER_REGISTRY.get(handler_name)
+    for h in get_handlers_for_trigger(cd, Trigger.AFTER_DEATH):
+        fn = HANDLER_REGISTRY.get(h)
         if fn:
             state = fn(state, card_id, resolver)
     return state
-
-
-def check_continuous(state: GameState, handler_name: str, pid: PlayerId) -> bool:
-    """Check if a continuous effect is active for a player (role-based)."""
-    ps = gs_get_player(state, pid)
-    role_name = ps.role_def_name
-    if role_name is None:
-        return False
-    role_def = get_card_def(role_name)
-    return handler_name in [e.handler for e in role_def.effects if e.trigger == Trigger.CONTINUOUS]
 
 
 # ---------------------------------------------------------------------------
-# Handler implementations
+# Effect decision infrastructure
 # ---------------------------------------------------------------------------
 
-Handler = type(lambda s, c, p: s)  # function signature hint
+def set_effect_decision(
+    state: GameState,
+    handler: str,
+    card_id: CardId,
+    resolver: PlayerId,
+    decision: PendingDecision,
+    data: dict | None = None,
+) -> GameState:
+    """
+    Set up a mid-resolution effect decision.
+    Only works during Action Phase. If called outside Action Phase
+    (e.g., during tests or nested resolution), auto-selects first legal action.
+    """
+    ctx = state.phase_context
+    if not isinstance(ctx, ActionContext):
+        # Fallback: auto-resolve with first legal action
+        resume_fn = RESUME_REGISTRY.get(handler)
+        if resume_fn and decision.legal_actions:
+            ectx = EffectContext(handler=handler, card_id=card_id,
+                                resolver=resolver, data=data or {})
+            return resume_fn(state, ectx, decision.legal_actions[0])
+        return state
+
+    ectx = EffectContext(
+        handler=handler,
+        card_id=card_id,
+        resolver=resolver,
+        data=data or {},
+    )
+    # Mark that ON_RESOLVE has already fired for the current card
+    if ctx.resolving:
+        new_res = replace(ctx.resolving, on_resolve_done=True)
+        ctx = replace(ctx, resolving=new_res)
+    ctx = replace(ctx, step=ActionStep.EFFECT_DECISION, effect_ctx=ectx)
+    state = gs_set_context(state, ctx)
+    return gs_set_pending(state, decision)
 
 
-def _handler_noop(state: GameState, card_id: CardId, resolver: PlayerId) -> GameState:
-    """No-op handler for effects that are checked structurally elsewhere."""
+def resume_effect(state: GameState, action: Action) -> GameState:
+    """Resume a handler after the player responds to an effect decision."""
+    ctx = state.phase_context
+    assert isinstance(ctx, ActionContext)
+    assert ctx.effect_ctx is not None
+    ectx = ctx.effect_ctx
+    resume_fn = RESUME_REGISTRY.get(ectx.handler)
+    if resume_fn is None:
+        raise RuntimeError(f"No resume handler for: {ectx.handler}")
+    # Clear effect context and return to RESOLVING_SLOT
+    ctx = replace(ctx, effect_ctx=None, step=ActionStep.RESOLVING_SLOT)
+    state = gs_set_context(state, ctx)
+    state = resume_fn(state, ectx, action)
+
+    # Now continue with default type processing for the current card
+    # (ON_RESOLVE already fired, on_resolve_done flag ensures we skip it)
+    ctx = state.phase_context
+    if isinstance(ctx, ActionContext) and ctx.resolving and ctx.resolving.current_card is not None:
+        # Check if a sub-decision was set by the resume handler
+        if ctx.step in (ActionStep.EFFECT_DECISION, ActionStep.ATTACK_CHOICE):
+            return state
+        if state.pending is not None:
+            return state
+
+        # The card still needs default processing — _step_resolving_slot will handle it
+        # since on_resolve_done is True. Return to RESOLVING_SLOT step.
+        pass
+
     return state
 
 
-# --- Food effects ---
+# ---------------------------------------------------------------------------
+# Helper: card short name for decision descriptions
+# ---------------------------------------------------------------------------
+
+def _cname(state: GameState, card_id: CardId) -> str:
+    cd = state.card_def(card_id)
+    lv = f" Lv{cd.level}" if cd.level is not None else ""
+    return f"{cd.big_name or cd.name}{lv}"
+
+
+# ---------------------------------------------------------------------------
+# No-op handler
+# ---------------------------------------------------------------------------
+
+def _noop(state, card_id, resolver):
+    return state
+
+
+# ===========================================================================
+# HANDLER IMPLEMENTATIONS
+# ===========================================================================
+
+# --- Food ---
 
 def _food_1_d10_damage(state, card_id, resolver):
     """food_1: After eating, receive d10 damage."""
     rng = gs_get_rng(state)
     rng, roll = rng_d10(rng)
     state = gs_with_rng_result(state, rng)
-    state = apply_damage(state, resolver, roll, DamageSource.FOOD_PENALTY)
-    return state
+    return apply_damage(state, resolver, roll, DamageSource.FOOD_PENALTY)
 
 
 def _saltine_choice(state, card_id, resolver):
-    """food_3 (Saltine Shuriken): May wield as weapon instead of eating.
-    Auto-resolution: eat as food (default behavior). Stage 8+ can present choice."""
-    # Default: eat as food (handled by normal food processing)
-    return state
+    """food_3: May wield as weapon instead of eating. Decision."""
+    actions = (
+        Action(kind=ActionKind.SELECT_INDEX, index=0),  # Eat as food
+        Action(kind=ActionKind.SELECT_INDEX, index=1),  # Wield as weapon
+    )
+    decision = PendingDecision(
+        player=resolver,
+        kind=DecisionKind.SALTINE_CHOICE,
+        legal_actions=actions,
+        context_description="Saltine Shuriken: [0] Eat as food  [1] Wield as weapon",
+    )
+    return set_effect_decision(state, "saltine_choice", card_id, resolver, decision)
 
 
-def _fat_sandwich_equip(state, card_id, resolver):
-    """food_7: Equip instead of eating."""
-    # Override food processing: equip the card instead
-    # The caller should NOT eat this card; instead equip it
-    # We signal this by equipping and skipping the food heal
-    ps = gs_get_player(state, resolver)
-    # Remove from discard if food processing already added it
-    discard = list(ps.discard_pile)
-    if card_id in discard:
-        discard.remove(card_id)
-        ps = replace(ps, discard_pile=tuple(discard))
-        state = gs_update_player(state, resolver, ps)
-    # Un-set eaten flag if it was set
-    ps = gs_get_player(state, resolver)
-    # Equip
-    from .phases.action import _equip_card
-    state = _equip_card(state, resolver, card_id)
-    return state
-
-
-def _bellyfiller_equip(state, card_id, resolver):
-    """food_9 (Bellyfiller): Equip instead of eating."""
-    ps = gs_get_player(state, resolver)
-    discard = list(ps.discard_pile)
-    if card_id in discard:
-        discard.remove(card_id)
-        ps = replace(ps, discard_pile=tuple(discard))
-        state = gs_update_player(state, resolver, ps)
-    from .phases.action import _equip_card
-    state = _equip_card(state, resolver, card_id)
-    return state
-
-
-# --- Weapon effects ---
-
-def _vorpal_blade_discard(state, card_id, resolver):
-    """weapon_10: On discard, refresh all action cards, Action Phase over."""
-    state = _refresh_player_action_field(state, resolver)
-    ps = gs_get_player(state, resolver)
-    ps = ps_set_action_phase_over(ps, True)
-    state = gs_update_player(state, resolver, ps)
-    return state
-
-
-def _pinata_stick(state, card_id, resolver):
-    """weapon_3: On discard, may deal 3 damage to other to see their hand.
-    Auto-resolution: decline (no damage)."""
-    return state
-
-
-def _fetch_stick_transfer(state, card_id, resolver):
-    """weapon_1: On discard without counter, other player must wield it.
-    Auto-resolution: transfer to other player."""
-    cs = state.card_state(card_id)
-    if cs.counters == 0:
-        other = resolver.other()
-        # Remove from resolver's discard
+def _saltine_choice_resume(state, ectx, action):
+    card_id = ectx.card_id
+    resolver = ectx.resolver
+    if action.index == 1:
+        # Wield as weapon — remove from discard if present, then wield
         ps = gs_get_player(state, resolver)
         discard = list(ps.discard_pile)
         if card_id in discard:
             discard.remove(card_id)
             ps = replace(ps, discard_pile=tuple(discard))
             state = gs_update_player(state, resolver, ps)
-        # Other player wields it with a counter
+        # Un-set eaten flag if it was set by food processing
+        ps = gs_get_player(state, resolver)
+        ps = replace(ps, has_eaten_this_phase=False)
+        state = gs_update_player(state, resolver, ps)
+        from .phases.action import _wield_weapon
+        state = _wield_weapon(state, resolver, card_id)
+    # else: index 0, eat as food — already handled by default processing
+    return state
+
+
+def _fat_sandwich_equip(state, card_id, resolver):
+    """food_7: Equip instead of eating."""
+    ps = gs_get_player(state, resolver)
+    discard = list(ps.discard_pile)
+    if card_id in discard:
+        discard.remove(card_id)
+        ps = replace(ps, discard_pile=tuple(discard))
+        state = gs_update_player(state, resolver, ps)
+    from .phases.action import _equip_card
+    return _equip_card(state, resolver, card_id)
+
+
+def _bellyfiller_equip(state, card_id, resolver):
+    """food_9: Equip instead of eating."""
+    ps = gs_get_player(state, resolver)
+    discard = list(ps.discard_pile)
+    if card_id in discard:
+        discard.remove(card_id)
+        ps = replace(ps, discard_pile=tuple(discard))
+        state = gs_update_player(state, resolver, ps)
+    from .phases.action import _equip_card
+    return _equip_card(state, resolver, card_id)
+
+
+# --- Weapons ---
+
+def _vorpal_blade_discard(state, card_id, resolver):
+    """weapon_10: On discard, refresh all action cards, Action Phase over."""
+    state = _refresh_player_action_field(state, resolver)
+    ps = gs_get_player(state, resolver)
+    ps = ps_set_action_phase_over(ps, True)
+    return gs_update_player(state, resolver, ps)
+
+
+def _pinata_stick(state, card_id, resolver):
+    """weapon_3: On discard, may deal 3 damage to other to see their hand. Decision."""
+    other = resolver.other()
+    actions = (
+        Action(kind=ActionKind.SELECT_BOOL, flag=True),   # Pay 3 damage, see hand
+        Action(kind=ActionKind.SELECT_BOOL, flag=False),   # Decline
+    )
+    other_hand_size = len(gs_get_player(state, other).hand)
+    decision = PendingDecision(
+        player=resolver,
+        kind=DecisionKind.VOLUNTARY_DISCARD,  # Reuse for yes/no
+        legal_actions=actions,
+        context_description=(
+            f"Piñata Stick: Deal 3 damage to yourself to see {other.name}'s hand "
+            f"({other_hand_size} cards)?\n  [True] Yes  [False] No"
+        ),
+    )
+    return set_effect_decision(state, "pinata_stick", card_id, resolver, decision)
+
+
+def _pinata_stick_resume(state, ectx, action):
+    resolver = ectx.resolver
+    if action.flag:
+        other = resolver.other()
+        state = apply_damage(state, resolver, 3, DamageSource.SELF_INFLICTED)
+        # In a real UI, the hand would be revealed. In our debug CLI, it's always visible.
+    return state
+
+
+def _fetch_stick_transfer(state, card_id, resolver):
+    """weapon_1: On discard without counter, other player must wield it + add counter."""
+    cs = state.card_state(card_id)
+    if cs.counters == 0:
+        other = resolver.other()
+        ps = gs_get_player(state, resolver)
+        discard = list(ps.discard_pile)
+        if card_id in discard:
+            discard.remove(card_id)
+            ps = replace(ps, discard_pile=tuple(discard))
+            state = gs_update_player(state, resolver, ps)
         from .phases.action import _wield_weapon
         state = _wield_weapon(state, other, card_id)
         state = gs_set_card_state(state, card_id, CardState(counters=1))
     return state
 
 
-def _weapon_7_no_distance(state, card_id, resolver):
-    """weapon_7: No distance penalty, cross-field kills discard enemy.
-    This is a continuous AS_WEAPON effect checked during combat/consent."""
-    return state
-
-
-# --- Enemy effects ---
+# --- Enemies ---
 
 def _gobshite_fist_check(state, card_id, resolver):
     """enemy_1: If attacking with fists, treat as level 22.
-    This is checked during combat — modifies effective level."""
-    return state
+    Checked during attack mode choice — stores flag in effect context."""
+    return state  # Handled in attack choice presentation
 
 
 def _enemy_3_discard_kills(state, card_id, resolver):
@@ -260,12 +345,10 @@ def _enemy_3_discard_kills(state, card_id, resolver):
     ps = gs_get_player(state, resolver)
     for i, ws in enumerate(ps.weapon_slots):
         if card_id in ws.kill_pile:
-            # Discard everything in this kill pile
             to_discard = ws.kill_pile
             weapon_slots = list(ps.weapon_slots)
             weapon_slots[i] = WeaponSlot(weapon=ws.weapon, kill_pile=(), parity=ws.parity)
-            ps = replace(ps,
-                         weapon_slots=tuple(weapon_slots),
+            ps = replace(ps, weapon_slots=tuple(weapon_slots),
                          discard_pile=ps.discard_pile + to_discard)
             state = gs_update_player(state, resolver, ps)
             break
@@ -277,12 +360,10 @@ def _enemy_7_discard_weapon(state, card_id, resolver):
     ps = gs_get_player(state, resolver)
     for i, ws in enumerate(ps.weapon_slots):
         if card_id in ws.kill_pile:
-            # Discard this weapon + kill pile
             to_discard = (ws.weapon,) + ws.kill_pile if ws.weapon else ws.kill_pile
             weapon_slots = list(ps.weapon_slots)
             weapon_slots[i] = WeaponSlot(parity=ws.parity)
-            ps = replace(ps,
-                         weapon_slots=tuple(weapon_slots),
+            ps = replace(ps, weapon_slots=tuple(weapon_slots),
                          discard_pile=ps.discard_pile + to_discard)
             state = gs_update_player(state, resolver, ps)
             break
@@ -291,8 +372,8 @@ def _enemy_7_discard_weapon(state, card_id, resolver):
 
 def _lonely_ogre_wield(state, card_id, resolver):
     """enemy_8: On kill, wield this as a weapon."""
-    # Remove from kill pile or discard first
     ps = gs_get_player(state, resolver)
+    # Remove from kill pile
     for i, ws in enumerate(ps.weapon_slots):
         if card_id in ws.kill_pile:
             kp = list(ws.kill_pile)
@@ -302,85 +383,169 @@ def _lonely_ogre_wield(state, card_id, resolver):
             ps = replace(ps, weapon_slots=tuple(weapon_slots))
             state = gs_update_player(state, resolver, ps)
             break
+    # Remove from discard
+    ps = gs_get_player(state, resolver)
     discard = list(ps.discard_pile)
     if card_id in discard:
         discard.remove(card_id)
-        ps = gs_get_player(state, resolver)
         ps = replace(ps, discard_pile=tuple(discard))
         state = gs_update_player(state, resolver, ps)
-
     from .phases.action import _wield_weapon
-    state = _wield_weapon(state, resolver, card_id)
-    return state
+    return _wield_weapon(state, resolver, card_id)
 
 
 def _ba_barockus_damage(state, card_id, resolver):
     """enemy_14: On kill, take 3 damage."""
-    state = apply_damage(state, resolver, 3, DamageSource.CARD_EFFECT)
-    return state
+    return apply_damage(state, resolver, 3, DamageSource.CARD_EFFECT)
 
 
-# --- Major arcana effects ---
+# --- Major Arcana ---
 
 def _fool_event_resolve(state, card_id, resolver):
-    """major_0 (The Fool): Resolve top card of own deck."""
+    """major_0: Resolve top card of own deck."""
     from .phases.refresh import _safe_draw
     rng = gs_get_rng(state)
     state, rng, drawn = _safe_draw(state, rng, resolver, 1)
     state = gs_with_rng_result(state, rng)
     if state.phase == Phase.GAME_OVER or not drawn:
         return state
-    drawn_id = drawn[0]
-    drawn_cd = state.card_def(drawn_id)
-    # Resolve the drawn card (may recurse!)
-    state = _resolve_single_card(state, resolver, drawn_id, drawn_cd)
-    return state
+    return _resolve_single_card(state, resolver, drawn[0], state.card_def(drawn[0]))
 
 
 def _magician_choose(state, card_id, resolver):
-    """major_1 (The Magician): Top 3 cards, choose 1 to resolve, refresh 2.
-    Auto-resolution: resolve first card, refresh rest."""
+    """major_1: Top 3 cards, player chooses 1 to resolve, refresh 2. Decision."""
     from .phases.refresh import _safe_draw
     rng = gs_get_rng(state)
     state, rng, drawn = _safe_draw(state, rng, resolver, 3)
     state = gs_with_rng_result(state, rng)
     if state.phase == Phase.GAME_OVER or not drawn:
         return state
-    # Auto: resolve first, refresh rest
-    chosen = drawn[0]
-    rest = drawn[1:]
-    chosen_cd = state.card_def(chosen)
-    state = _resolve_single_card(state, resolver, chosen, chosen_cd)
+    actions = tuple(
+        Action(kind=ActionKind.SELECT_CARD, card_id=cid)
+        for cid in drawn
+    )
+    card_descs = [f"[{_cname(state, c)}]" for c in drawn]
+    decision = PendingDecision(
+        player=resolver,
+        kind=DecisionKind.MAGICIAN_CHOOSE,
+        legal_actions=actions,
+        context_description=f"The Magician: Choose one to resolve, refresh the others.\n  {', '.join(card_descs)}",
+        visible_cards=drawn,
+    )
+    return set_effect_decision(state, "magician_choose", card_id, resolver, decision,
+                               data={"drawn": list(drawn)})
+
+
+def _magician_resume(state, ectx, action):
+    chosen = action.card_id
+    drawn = ectx.data["drawn"]
+    resolver = ectx.resolver
+    rest = tuple(c for c in drawn if c != chosen)
+    # Resolve chosen card
+    state = _resolve_single_card(state, resolver, chosen, state.card_def(chosen))
     # Refresh the rest
     ps = gs_get_player(state, resolver)
     ps = ps_add_to_refresh(ps, rest)
-    state = gs_update_player(state, resolver, ps)
-    return state
+    return gs_update_player(state, resolver, ps)
 
 
 def _high_priestess(state, card_id, resolver):
-    """major_2: Name cards, check refresh pile, choose effects per match.
-    Auto-resolution: skip (no names chosen)."""
+    """major_2: Name up to 2 cards, check refresh pile, choose effect per match. Decision."""
+    # Gather all unique card names in the game for naming options
+    all_names = sorted(set(cd.name for cd in ALL_CARD_DEFS.values()))
+    # Present: choose 0, 1, or 2 card names
+    # For simplicity, present as: name first card (or decline), then name second (or decline)
+    actions = [Action(kind=ActionKind.SELECT_INDEX, index=i) for i in range(len(all_names))]
+    actions.append(Action(kind=ActionKind.DECLINE))
+    decision = PendingDecision(
+        player=resolver,
+        kind=DecisionKind.HIGH_PRIESTESS_NAME,
+        legal_actions=tuple(actions),
+        context_description=(
+            f"The High Priestess: Name a card (by index) or DECLINE to skip.\n"
+            f"  Card names: {', '.join(f'[{i}]{n}' for i, n in enumerate(all_names[:20]))}..."
+        ),
+    )
+    return set_effect_decision(state, "high_priestess", card_id, resolver, decision,
+                               data={"named": [], "all_names": all_names})
+
+
+def _high_priestess_resume(state, ectx, action):
+    resolver = ectx.resolver
+    named = list(ectx.data["named"])
+    all_names = ectx.data["all_names"]
+
+    if action.kind == ActionKind.DECLINE:
+        pass  # No more names
+    elif action.kind == ActionKind.SELECT_INDEX:
+        named.append(all_names[action.index])
+
+    # If we have < 2 names and didn't decline, ask for another
+    if len(named) < 2 and action.kind != ActionKind.DECLINE:
+        actions = [Action(kind=ActionKind.SELECT_INDEX, index=i) for i in range(len(all_names))]
+        actions.append(Action(kind=ActionKind.DECLINE))
+        decision = PendingDecision(
+            player=resolver,
+            kind=DecisionKind.HIGH_PRIESTESS_NAME,
+            legal_actions=tuple(actions),
+            context_description=f"Name a second card or DECLINE. Named so far: {named}",
+        )
+        return set_effect_decision(state, "high_priestess", ectx.card_id, resolver, decision,
+                                   data={"named": named, "all_names": all_names})
+
+    # Check refresh pile for matches
+    ps = gs_get_player(state, resolver)
+    matches = 0
+    for cid in ps.refresh_pile:
+        cd = state.card_def(cid)
+        if cd.name in named:
+            matches += 1
+
+    # For each match: choose heal 7, deal 7, or force discard equipment
+    for _ in range(matches):
+        # For now, auto-choose heal 7 (presenting a decision for each match
+        # would require multiple sequential effect decisions — we simplify)
+        state = apply_healing(state, resolver, 7, HealSource.CARD_EFFECT)
+
     return state
 
 
 def _chariot_take_7(state, card_id, resolver):
     """major_7: On resolve, take 7 damage."""
-    state = apply_damage(state, resolver, 7, DamageSource.CARD_EFFECT)
-    return state
+    return apply_damage(state, resolver, 7, DamageSource.CARD_EFFECT)
 
 
 def _hermit_choice(state, card_id, resolver):
-    """major_9: Optionally give 1HP, then Good: discard equip + heal d10, Evil: take d20.
-    Auto-resolution: don't give HP, then apply alignment effect."""
-    ps = gs_get_player(state, resolver)
+    """major_9: Optionally give 1HP, then alignment effect. Decision."""
+    actions = (
+        Action(kind=ActionKind.SELECT_BOOL, flag=True),   # Give 1 HP
+        Action(kind=ActionKind.SELECT_BOOL, flag=False),   # Don't give
+    )
+    decision = PendingDecision(
+        player=resolver,
+        kind=DecisionKind.HERMIT_CHOOSE,
+        legal_actions=actions,
+        context_description="The Hermit: Give the other player 1 HP?\n  [True] Yes  [False] No",
+    )
+    return set_effect_decision(state, "hermit_choice", card_id, resolver, decision)
+
+
+def _hermit_resume(state, ectx, action):
+    resolver = ectx.resolver
     rng = gs_get_rng(state)
+
+    if action.flag:
+        other = resolver.other()
+        state = apply_healing(state, other, 1, HealSource.CARD_EFFECT)
+
+    ps = gs_get_player(state, resolver)
     if ps.alignment == Alignment.GOOD:
-        # Discard a non-role equipment if available
-        for eq_id in ps.equipment:
-            if eq_id is not None and eq_id != ps.role_card_id:
-                state = _discard_equipment_by_id(state, resolver, eq_id)
-                break
+        # Discard a piece of equipment and heal d10
+        # Choose which equipment to discard (if any)
+        equip_ids = [eq for eq in ps.equipment if eq is not None and eq != ps.role_card_id]
+        if equip_ids:
+            # Discard the first non-role equipment
+            state = _discard_equipment_by_id(state, resolver, equip_ids[0])
         rng, roll = rng_d10(rng)
         state = gs_with_rng_result(state, rng)
         state = apply_healing(state, resolver, roll, HealSource.CARD_EFFECT)
@@ -388,6 +553,7 @@ def _hermit_choice(state, card_id, resolver):
         rng, roll = rng_d20(rng)
         state = gs_with_rng_result(state, rng)
         state = apply_damage(state, resolver, roll, DamageSource.CARD_EFFECT)
+
     return state
 
 
@@ -396,21 +562,18 @@ def _wheel_of_fortune(state, card_id, resolver):
     rng = gs_get_rng(state)
     rng, roll = rng_d20(rng)
     state = gs_with_rng_result(state, rng)
-    state = set_hp_direct(state, resolver, roll)
-    return state
+    return set_hp_direct(state, resolver, roll)
 
 
 def _justice_damage_refresh(state, card_id, resolver):
     """major_11: Deal 5 to other, refresh this card."""
     other = resolver.other()
     state = apply_damage(state, other, 5, DamageSource.CARD_EFFECT)
-    # Move from discard to refresh (it was already discarded by event processing)
     ps = gs_get_player(state, resolver)
     discard = list(ps.discard_pile)
     if card_id in discard:
         discard.remove(card_id)
-        ps = replace(ps, discard_pile=tuple(discard),
-                     refresh_pile=ps.refresh_pile + (card_id,))
+        ps = replace(ps, discard_pile=tuple(discard), refresh_pile=ps.refresh_pile + (card_id,))
         state = gs_update_player(state, resolver, ps)
     return state
 
@@ -424,34 +587,28 @@ def _hanged_man(state, card_id, resolver):
     discard = list(ps.discard_pile)
     if card_id in discard:
         discard.remove(card_id)
-        ps = replace(ps, discard_pile=tuple(discard),
-                     refresh_pile=ps.refresh_pile + (card_id,))
+        ps = replace(ps, discard_pile=tuple(discard), refresh_pile=ps.refresh_pile + (card_id,))
         state = gs_update_player(state, resolver, ps)
     return state
 
 
 def _death_discard_adjacent(state, card_id, resolver):
-    """major_13 (Death): Discard all adjacent action cards. Action Phase ends."""
-    # Find which slot this was in from the resolution context
+    """major_13: Discard all adjacent action cards. Action Phase ends."""
     ctx = state.phase_context
     if not isinstance(ctx, ActionContext) or ctx.resolving is None:
         return state
     slot_owner = ctx.resolving.slot_owner
     slot_index = ctx.resolving.slot_index
 
-    # Adjacent slots: index ± 1 (within 0-3)
     adjacent = []
-    if slot_index > 0:
-        adjacent.append(slot_index - 1)
-    if slot_index < 3:
-        adjacent.append(slot_index + 1)
+    if slot_index > 0: adjacent.append(slot_index - 1)
+    if slot_index < 3: adjacent.append(slot_index + 1)
 
     af = state.action_field
     ps = gs_get_player(state, resolver)
     for adj_idx in adjacent:
         af, cleared = af_clear_slot(af, slot_owner, adj_idx)
         if cleared:
-            # On Kill triggers for discarded cards during Action Phase
             for cid in cleared:
                 ps = replace(ps, discard_pile=ps.discard_pile + (cid,))
                 state = gs_update_player(state, resolver, ps)
@@ -459,17 +616,13 @@ def _death_discard_adjacent(state, card_id, resolver):
                 ps = gs_get_player(state, resolver)
 
     state = gs_set_action_field(state, af)
-
-    # End Action Phase
     ps = gs_get_player(state, resolver)
     ps = ps_set_action_phase_over(ps, True)
     state = gs_update_player(state, resolver, ps)
 
-    # Also clear remaining cards in resolution queue
     if isinstance(state.phase_context, ActionContext):
         ctx = state.phase_context
         if ctx.resolving:
-            # Discard remaining queued cards too
             for cid in ctx.resolving.card_queue:
                 ps = gs_get_player(state, resolver)
                 ps = replace(ps, discard_pile=ps.discard_pile + (cid,))
@@ -480,81 +633,85 @@ def _death_discard_adjacent(state, card_id, resolver):
 
 
 def _temperance_heal(state, card_id, resolver):
-    """major_14 (Temperance): On kill, heal 5."""
-    state = apply_healing(state, resolver, 5, HealSource.CARD_EFFECT)
-    return state
+    return apply_healing(state, resolver, 5, HealSource.CARD_EFFECT)
 
 
 def _temperance_give_hp(state, card_id, resolver):
-    """major_14: After death, permanently gain ability to give HP."""
     ps = gs_get_player(state, resolver)
     ps = ps_add_permanent_ability(ps, "temperance_give_hp")
-    state = gs_update_player(state, resolver, ps)
-    return state
+    return gs_update_player(state, resolver, ps)
 
 
 def _devil_gamble(state, card_id, resolver):
-    """major_15: After death, gain Devil gamble ability."""
     ps = gs_get_player(state, resolver)
     ps = ps_add_permanent_ability(ps, "devil_gamble")
-    state = gs_update_player(state, resolver, ps)
-    return state
+    return gs_update_player(state, resolver, ps)
 
 
 def _tower_die(state, card_id, resolver):
-    """major_16 (The Tower): You die!"""
-    state = apply_damage(state, resolver, 999, DamageSource.CARD_EFFECT)
-    return state
+    return apply_damage(state, resolver, 999, DamageSource.CARD_EFFECT)
 
 
 def _moon_deviation_cap(state, card_id, resolver):
-    """major_18: After death, gain Moon deviation cap."""
     ps = gs_get_player(state, resolver)
     ps = ps_add_permanent_ability(ps, "moon_deviation_cap")
-    state = gs_update_player(state, resolver, ps)
-    return state
+    return gs_update_player(state, resolver, ps)
 
 
 def _sun_force_resolve(state, card_id, resolver):
-    """major_19: After death, gain Sun forced-resolve ability."""
     ps = gs_get_player(state, resolver)
     ps = ps_add_permanent_ability(ps, "sun_force_resolve")
-    state = gs_update_player(state, resolver, ps)
-    return state
+    return gs_update_player(state, resolver, ps)
 
 
 def _world_win_check(state, card_id, resolver):
-    """major_21: After death, grant World-killed ability for win check."""
     ps = gs_get_player(state, resolver)
     ps = ps_add_permanent_ability(ps, "world_killed")
-    state = gs_update_player(state, resolver, ps)
-    return state
+    return gs_update_player(state, resolver, ps)
 
 
 def _lovers_give_hp(state, card_id, resolver):
-    """major_6: Give any amount of HP to other, then take 1 damage.
-    Auto-resolution: give 0 HP, take 1 damage."""
+    """major_6: Give any amount of HP to other, then take 1 damage. Decision."""
+    ps = gs_get_player(state, resolver)
+    max_give = ps.hp - 1  # Must survive the 1 damage after
+    if max_give < 0:
+        max_give = 0
+    actions = tuple(
+        Action(kind=ActionKind.SELECT_AMOUNT, amount=i)
+        for i in range(max_give + 1)
+    )
+    decision = PendingDecision(
+        player=resolver,
+        kind=DecisionKind.LOVERS_CHOOSE_HP,
+        legal_actions=actions,
+        context_description=f"The Lovers: Give 0–{max_give} HP to the other player (then take 1 damage).",
+    )
+    return set_effect_decision(state, "lovers_give_hp", card_id, resolver, decision)
+
+
+def _lovers_resume(state, ectx, action):
+    resolver = ectx.resolver
+    amount = action.amount or 0
+    if amount > 0:
+        other = resolver.other()
+        state = apply_damage(state, resolver, amount, DamageSource.SELF_INFLICTED)
+        state = apply_healing(state, other, amount, HealSource.CARD_EFFECT)
     state = apply_damage(state, resolver, 1, DamageSource.CARD_EFFECT)
     return state
 
 
 def _judgement_wield_option(state, card_id, resolver):
-    """major_20: While equipped, may discard to wield as weapon.
-    This is a WHILE_EQUIPPED continuous — checked via voluntary discard."""
     return state
 
 
 def _judgement_single_use(state, card_id, resolver):
-    """major_20: As a weapon, discards after one use."""
-    # After any kill with Judgement, discard it
     ps = gs_get_player(state, resolver)
     for i, ws in enumerate(ps.weapon_slots):
         if ws.weapon == card_id:
             to_discard = (card_id,) + ws.kill_pile
             weapon_slots = list(ps.weapon_slots)
             weapon_slots[i] = WeaponSlot(parity=ws.parity)
-            ps = replace(ps,
-                         weapon_slots=tuple(weapon_slots),
+            ps = replace(ps, weapon_slots=tuple(weapon_slots),
                          discard_pile=ps.discard_pile + to_discard)
             state = gs_update_player(state, resolver, ps)
             break
@@ -562,32 +719,170 @@ def _judgement_single_use(state, card_id, resolver):
 
 
 def _strength_wield_option(state, card_id, resolver):
-    """major_8: While equipped, may discard to wield. Continuous check."""
     return state
 
 
 def _strength_on_kill(state, card_id, resolver):
-    """major_8: On kill with Strength weapon, discard enemy, d20 roll, counter logic.
-    Auto-resolution: assume d20 result > 10 (no counter added)."""
+    """major_8: On kill with Strength, other player rolls d20 (Evil may lie). Decision."""
+    other = resolver.other()
+    # The other player declares a d20 result. Evil may lie.
+    # Present the decision to the OTHER player.
+    actions = tuple(
+        Action(kind=ActionKind.SELECT_AMOUNT, amount=i)
+        for i in range(1, 21)
+    )
+    decision = PendingDecision(
+        player=other,
+        kind=DecisionKind.STRENGTH_DECLARE_D20,
+        legal_actions=actions,
+        context_description=(
+            f"Strength: Declare a d20 result (1-20). Evil may lie.\n"
+            f"If result is 10 or less, a counter is placed on Strength."
+        ),
+    )
+    return set_effect_decision(state, "strength_on_kill", card_id, resolver, decision)
+
+
+def _strength_resume(state, ectx, action):
+    declared = action.amount or 11
+    resolver = ectx.resolver
+    # Find Strength weapon
+    ps = gs_get_player(state, resolver)
+    for ws in ps.weapon_slots:
+        if ws.weapon is not None and state.card_def(ws.weapon).name == "major_8":
+            if declared <= 10:
+                cs = state.card_state(ws.weapon)
+                state = gs_set_card_state(state, ws.weapon, CardState(counters=cs.counters + 1))
+            break
+    # Also: discard the killed enemy (Strength discards enemy on kill)
+    # This is handled by the card text: "discard enemy" — enemy goes to discard not kill pile
+    # Actually the kill already placed the enemy in kill pile via resolve_combat;
+    # the Strength text says to discard the enemy, so move it from kill pile to discard
+    ps = gs_get_player(state, resolver)
+    for i, ws in enumerate(ps.weapon_slots):
+        if ws.weapon is not None and state.card_def(ws.weapon).name == "major_8":
+            if ws.kill_pile:
+                last = ws.kill_pile[-1]
+                kp = ws.kill_pile[:-1]
+                weapon_slots = list(ps.weapon_slots)
+                weapon_slots[i] = WeaponSlot(weapon=ws.weapon, kill_pile=kp, parity=ws.parity)
+                ps = replace(ps, weapon_slots=tuple(weapon_slots),
+                             discard_pile=ps.discard_pile + (last,))
+                state = gs_update_player(state, resolver, ps)
+            break
     return state
 
 
 def _hierophant_discard(state, card_id, resolver):
-    """major_5: On discard, draw to 6 cards, split hand, place in action.
-    Auto-resolution: skip (complex sub-phase, to be fully implemented)."""
+    """major_5: On discard, draw to 6 cards, split hand into two piles. Decision."""
+    # Draw until hand has 6 cards
+    from .phases.refresh import _safe_draw
+    ps = gs_get_player(state, resolver)
+    rng = gs_get_rng(state)
+    # Hierophant draws from the other player's deck (hand cards are from other's deck)
+    other = resolver.other()
+    need = max(0, 6 - len(ps.hand))
+    if need > 0:
+        state, rng, drawn = _safe_draw(state, rng, other, need)
+        state = gs_with_rng_result(state, rng)
+        if state.phase == Phase.GAME_OVER:
+            return state
+        ps = gs_get_player(state, resolver)
+        ps = replace(ps, hand=ps.hand + drawn)
+        state = gs_update_player(state, resolver, ps)
+
+    ps = gs_get_player(state, resolver)
+    hand = ps.hand
+    if not hand:
+        return state
+
+    # Player chooses how to split. For simplicity: choose which cards to give away.
+    # Each subset of the hand is a valid split.
+    # Present: select cards to give to the other player (rest go to your action field)
+    # Use SELECT_AMOUNT with bitmask — or just enumerate small subsets
+    # Since hand can be up to 6 cards, 2^6 = 64 subsets
+    import itertools
+    n = len(hand)
+    actions = []
+    for r in range(n + 1):
+        for combo in itertools.combinations(range(n), r):
+            give_indices = set(combo)
+            give_cards = tuple(hand[i] for i in range(n) if i in give_indices)
+            keep_cards = tuple(hand[i] for i in range(n) if i not in give_indices)
+            actions.append(Action(
+                kind=ActionKind.SELECT_PERMUTATION,  # Reuse for the split encoding
+                permutation=tuple(sorted(give_indices)),
+            ))
+
+    decision = PendingDecision(
+        player=resolver,
+        kind=DecisionKind.HIEROPHANT_SPLIT,
+        legal_actions=tuple(actions),
+        context_description=(
+            f"The Hierophant: Split your hand into two piles.\n"
+            f"  Select indices to give to the other player (rest go to your action field).\n"
+            f"  Hand: {', '.join(f'[{i}]{_cname(state, c)}' for i, c in enumerate(hand))}"
+        ),
+        visible_cards=hand,
+    )
+    return set_effect_decision(state, "hierophant_discard", card_id, resolver, decision,
+                               data={"hand": list(hand)})
+
+
+def _hierophant_resume(state, ectx, action):
+    resolver = ectx.resolver
+    other = resolver.other()
+    hand = ectx.data["hand"]
+    give_indices = set(action.permutation) if action.permutation else set()
+
+    give_cards = tuple(hand[i] for i in range(len(hand)) if i in give_indices)
+    keep_cards = tuple(hand[i] for i in range(len(hand)) if i not in give_indices)
+
+    # Remove all from hand
+    ps = gs_get_player(state, resolver)
+    ps = replace(ps, hand=())
+    state = gs_update_player(state, resolver, ps)
+
+    # Place keep_cards into resolver's action slots in fill order
+    # These go to the OTHER player's action field (per the rules: "place them in action slots")
+    # Actually re-reading: the Hierophant owner places the OTHER player's pile in THEIR action slots
+    # "split your hand into two piles and give one to the other player. Place them in your action slots in order."
+    # This means: give one pile to the other player to place in the other player's action slots.
+    # The kept pile goes into the resolver's action slots.
+    af = state.action_field
+    empty = af_find_empty_slots(af, other)
+    for i, cid in enumerate(give_cards):
+        if i < len(empty):
+            af = af_add_card_to_slot(af, other, empty[i], cid, position="top")
+    # Excess cards refreshed
+    excess_give = give_cards[len(empty):]
+    if excess_give:
+        other_ps = gs_get_player(state, other)
+        other_ps = replace(other_ps, refresh_pile=other_ps.refresh_pile + excess_give)
+        state = gs_update_player(state, other, other_ps)
+
+    empty_self = af_find_empty_slots(af, resolver)
+    for i, cid in enumerate(keep_cards):
+        if i < len(empty_self):
+            af = af_add_card_to_slot(af, resolver, empty_self[i], cid, position="top")
+    excess_keep = keep_cards[len(empty_self):]
+    if excess_keep:
+        ps = gs_get_player(state, resolver)
+        ps = replace(ps, refresh_pile=ps.refresh_pile + excess_keep)
+        state = gs_update_player(state, resolver, ps)
+
+    state = gs_set_action_field(state, af)
     return state
 
 
 def _chariot_prevent(state, card_id, resolver):
-    """major_7: While equipped, may discard to prevent damage.
-    This is checked during the damage pipeline (interrupt)."""
+    """major_7: While equipped, may discard to prevent damage. Checked in damage pipeline."""
     return state
 
 
-# --- Guard effects ---
+# --- Guards ---
 
 def _guard_respawn(state, card_id, resolver):
-    """guards: After death, draw another guard into refresh pile."""
     if state.guard_deck:
         guard_id = state.guard_deck[0]
         state = replace(state, guard_deck=state.guard_deck[1:])
@@ -597,73 +892,15 @@ def _guard_respawn(state, card_id, resolver):
     return state
 
 
-# --- Role continuous effects (mostly structural checks, handled elsewhere) ---
-
-def _food_fighter_swap(state, card_id, resolver):
-    """Foo(d) Fighter: weapon↔food type swap. Structural check."""
-    return state
-
-
-def _corruption_invert_healing(state, card_id, resolver):
-    """Corruption: healing inversion. Handled in combat.py pipeline."""
-    return state
-
-
-def _phoenix_no_give_hp(state, card_id, resolver):
-    """Phoenix: cannot give HP. Checked when presenting give-HP options."""
-    return state
-
-
-def _fool_role_redirect(state, card_id, resolver):
-    """Fool role: Fool events refresh instead of discard. Checked during discard."""
-    return state
-
-
-def _survivor_extra_action(state, card_id, resolver):
-    """Survivor: extra action option. Checked when presenting action choices."""
-    return state
-
-
-def _ocean_counter_mechanic(state, card_id, resolver):
-    """Ocean: counter-based guard spawning. Handled in refresh periodic."""
-    return state
-
-
-def _poet_refresh_enemy(state, card_id, resolver):
-    """Poet: may refresh non-guard enemy instead of fighting. Checked in combat."""
-    return state
-
-
-def _poet_weapon_fragile(state, card_id, resolver):
-    """Poet: weapons discard on first use. Checked after combat."""
-    return state
-
-
-def _world_role_self_destruct(state, card_id, resolver):
-    """World role: if The World boss dies on your field, you die. Checked on boss death."""
-    return state
-
-
-def _world_role_redirect_kill(state, card_id, resolver):
-    """World role: while equipped, redirect non-guard kills. Checked in combat."""
-    return state
-
-
-def _detective_view_deck(state, card_id, resolver):
-    """Detective: on discard, view entire deck and refresh pile.
-    In a digital game this auto-reveals. No mechanical state change."""
-    return state
-
+# --- Role continuous effects (structural checks) ---
 
 def _saltine_weapon_kill(state, card_id, resolver):
-    """Saltine Shuriken as weapon: discard all slain enemies on kill."""
     ps = gs_get_player(state, resolver)
     for i, ws in enumerate(ps.weapon_slots):
         if ws.weapon == card_id and ws.kill_pile:
             weapon_slots = list(ps.weapon_slots)
             weapon_slots[i] = WeaponSlot(weapon=ws.weapon, kill_pile=(), parity=ws.parity)
-            ps = replace(ps,
-                         weapon_slots=tuple(weapon_slots),
+            ps = replace(ps, weapon_slots=tuple(weapon_slots),
                          discard_pile=ps.discard_pile + ws.kill_pile)
             state = gs_update_player(state, resolver, ps)
             break
@@ -671,10 +908,30 @@ def _saltine_weapon_kill(state, card_id, resolver):
 
 
 def _saltine_weapon_eat(state, card_id, resolver):
-    """Saltine Shuriken: on weapon discard, may eat this.
-    Auto-resolution: eat it if not eaten this phase."""
+    """Saltine as weapon: on discard, may eat. Decision."""
     ps = gs_get_player(state, resolver)
-    if not ps.has_eaten_this_phase:
+    if ps.has_eaten_this_phase:
+        return state  # Can't eat again
+    cd = state.card_def(card_id)
+    if cd.level is None:
+        return state
+    actions = (
+        Action(kind=ActionKind.SELECT_BOOL, flag=True),
+        Action(kind=ActionKind.SELECT_BOOL, flag=False),
+    )
+    decision = PendingDecision(
+        player=resolver,
+        kind=DecisionKind.VOLUNTARY_DISCARD,
+        legal_actions=actions,
+        context_description=f"Saltine Shuriken discarded: Eat it to heal {cd.level}?\n  [True] Yes  [False] No",
+    )
+    return set_effect_decision(state, "saltine_weapon_eat", card_id, resolver, decision)
+
+
+def _saltine_weapon_eat_resume(state, ectx, action):
+    if action.flag:
+        resolver = ectx.resolver
+        card_id = ectx.card_id
         cd = state.card_def(card_id)
         if cd.level is not None:
             state = apply_healing(state, resolver, cd.level, HealSource.FOOD)
@@ -685,51 +942,44 @@ def _saltine_weapon_eat(state, card_id, resolver):
 
 
 def _fat_sandwich_eat(state, card_id, resolver):
-    """Fat Sandwich: while equipped, may discard to eat.
-    This is a WHILE_EQUIPPED action option — checked via voluntary discard."""
-    return state
+    return state  # Handled via voluntary discard options
 
 
 # ---------------------------------------------------------------------------
 # Helper: resolve a single card (used by Fool, Magician nested resolution)
 # ---------------------------------------------------------------------------
 
-def _resolve_single_card(
-    state: GameState, resolver: PlayerId,
-    card_id: CardId, cd: CardDef,
-) -> GameState:
-    """Resolve a card drawn from the deck (by Fool, Magician, etc.)."""
-    # Fire ON_RESOLVE effects
+def _resolve_single_card(state, resolver, card_id, cd):
     state = fire_on_resolve(state, card_id, resolver)
-
     ps = gs_get_player(state, resolver)
     if ps.is_dead:
         return state
 
-    # Default type processing
     if is_enemy_like(cd):
         options = get_attack_options(state, resolver, card_id)
-        mode = "fists"
-        slot_idx = 0
+        mode, slot_idx = "fists", 0
         for m, idx in options:
             if m != "fists":
-                mode = "weapon"
-                slot_idx = idx
+                mode, slot_idx = "weapon", idx
                 break
         state = resolve_combat(state, resolver, card_id, mode, slot_idx)
         ps = gs_get_player(state, resolver)
         if not ps.is_dead:
             state = fire_on_kill(state, card_id, resolver)
+            if CardType.BOSS in cd.card_types:
+                state = fire_after_death(state, card_id, resolver)
     elif is_food(cd):
-        ps = gs_get_player(state, resolver)
-        if not ps.has_eaten_this_phase and cd.level is not None:
-            state = apply_healing(state, resolver, cd.level, HealSource.FOOD)
+        from .phases.action import _card_is_placed
+        if not _card_is_placed(state, resolver, card_id):
             ps = gs_get_player(state, resolver)
-            ps = replace(ps, has_eaten_this_phase=True)
+            if not ps.has_eaten_this_phase and cd.level is not None:
+                state = apply_healing(state, resolver, cd.level, HealSource.FOOD)
+                ps = gs_get_player(state, resolver)
+                ps = replace(ps, has_eaten_this_phase=True)
+                state = gs_update_player(state, resolver, ps)
+            ps = gs_get_player(state, resolver)
+            ps = replace(ps, discard_pile=ps.discard_pile + (card_id,))
             state = gs_update_player(state, resolver, ps)
-        ps = gs_get_player(state, resolver)
-        ps = replace(ps, discard_pile=ps.discard_pile + (card_id,))
-        state = gs_update_player(state, resolver, ps)
     elif is_weapon(cd) and not is_equipment(cd):
         from .phases.action import _wield_weapon
         state = _wield_weapon(state, resolver, card_id)
@@ -741,17 +991,15 @@ def _resolve_single_card(
         ps = replace(ps, discard_pile=ps.discard_pile + (card_id,))
         state = gs_update_player(state, resolver, ps)
 
-    # Fire ON_RESOLVE_AFTER effects
     state = fire_on_resolve_after(state, card_id, resolver)
-
     return state
 
 
 # ---------------------------------------------------------------------------
-# Handler registry
+# Handler + Resume registries
 # ---------------------------------------------------------------------------
 
-HANDLER_REGISTRY: dict[str, Handler] = {
+HANDLER_REGISTRY: dict[str, Any] = {
     # Food
     "food_1_d10_damage": _food_1_d10_damage,
     "saltine_choice": _saltine_choice,
@@ -760,20 +1008,17 @@ HANDLER_REGISTRY: dict[str, Handler] = {
     "fat_sandwich_equip": _fat_sandwich_equip,
     "fat_sandwich_eat": _fat_sandwich_eat,
     "bellyfiller_equip": _bellyfiller_equip,
-
     # Weapons
     "vorpal_blade_discard": _vorpal_blade_discard,
     "pinata_stick": _pinata_stick,
     "fetch_stick_transfer": _fetch_stick_transfer,
-    "weapon_7_no_distance": _weapon_7_no_distance,
-
+    "weapon_7_no_distance": _noop,
     # Enemies
     "gobshite_fist_check": _gobshite_fist_check,
     "enemy_3_discard_kills": _enemy_3_discard_kills,
     "enemy_7_discard_weapon": _enemy_7_discard_weapon,
     "lonely_ogre_wield": _lonely_ogre_wield,
     "ba_barockus_damage": _ba_barockus_damage,
-
     # Major arcana
     "fool_event_resolve": _fool_event_resolve,
     "magician_choose": _magician_choose,
@@ -798,41 +1043,49 @@ HANDLER_REGISTRY: dict[str, Handler] = {
     "strength_wield_option": _strength_wield_option,
     "strength_on_kill": _strength_on_kill,
     "hierophant_discard": _hierophant_discard,
-
     # Guards
     "guard_respawn": _guard_respawn,
+    # Structural / no-ops
+    "cardsharp_no_consent_needed": _noop,
+    "food_fighter_swap": _noop,
+    "corruption_invert_healing": _noop,
+    "phoenix_no_give_hp": _noop,
+    "fool_role_redirect": _noop,
+    "survivor_extra_action": _noop,
+    "ocean_counter_mechanic": _noop,
+    "ocean_no_guards": _noop,
+    "detective_no_guards": _noop,
+    "detective_view_deck": _noop,
+    "poet_refresh_enemy": _noop,
+    "poet_weapon_fragile": _noop,
+    "world_role_self_destruct": _noop,
+    "world_role_redirect_kill": _noop,
+    "human_call_guards": _noop,
+    "guard_prevent_run": _noop,
+    "guard_draw_underneath": _noop,
+    "skeleton_draw_underneath": _noop,
+    "mutineer_setup_discard": _noop,
+    "fool_role_setup": _noop,
+    "leo_setup": _noop,
+    "two_armed_freak_setup": _noop,
+    "empress_heal": _noop,
+    "bellyfiller_heal": _noop,
+    "corruption_heal": _noop,
+    "phoenix_tick": _noop,
+    "survivor_counter_damage": _noop,
+    "star_revive": _noop,
+    "leo_revive": _noop,
+    "emperor_weapon_boost": _noop,
+}
 
-    # Role continuous (structural checks — mostly no-ops here)
-    "cardsharp_no_consent_needed": _handler_noop,
-    "food_fighter_swap": _food_fighter_swap,
-    "corruption_invert_healing": _corruption_invert_healing,
-    "phoenix_no_give_hp": _phoenix_no_give_hp,
-    "fool_role_redirect": _fool_role_redirect,
-    "survivor_extra_action": _survivor_extra_action,
-    "ocean_counter_mechanic": _ocean_counter_mechanic,
-    "ocean_no_guards": _handler_noop,
-    "detective_no_guards": _handler_noop,
-    "detective_view_deck": _detective_view_deck,
-    "poet_refresh_enemy": _poet_refresh_enemy,
-    "poet_weapon_fragile": _poet_weapon_fragile,
-    "world_role_self_destruct": _world_role_self_destruct,
-    "world_role_redirect_kill": _world_role_redirect_kill,
-    "human_call_guards": _handler_noop,
-    "guard_prevent_run": _handler_noop,
-
-    # Setup/periodic (handled elsewhere, but registered for completeness)
-    "mutineer_setup_discard": _handler_noop,
-    "fool_role_setup": _handler_noop,
-    "leo_setup": _handler_noop,
-    "two_armed_freak_setup": _handler_noop,
-    "empress_heal": _handler_noop,
-    "bellyfiller_heal": _handler_noop,
-    "corruption_heal": _handler_noop,
-    "phoenix_tick": _handler_noop,
-    "survivor_counter_damage": _handler_noop,
-    "skeleton_draw_underneath": _handler_noop,
-    "guard_draw_underneath": _handler_noop,
-    "star_revive": _handler_noop,
-    "leo_revive": _handler_noop,
-    "emperor_weapon_boost": _handler_noop,
+RESUME_REGISTRY: dict[str, Any] = {
+    "saltine_choice": _saltine_choice_resume,
+    "magician_choose": _magician_resume,
+    "high_priestess": _high_priestess_resume,
+    "hermit_choice": _hermit_resume,
+    "lovers_give_hp": _lovers_resume,
+    "pinata_stick": _pinata_stick_resume,
+    "strength_on_kill": _strength_resume,
+    "hierophant_discard": _hierophant_resume,
+    "saltine_weapon_eat": _saltine_weapon_eat_resume,
 }

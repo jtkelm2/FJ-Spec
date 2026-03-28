@@ -34,7 +34,7 @@ from ..types import (
     ActionSlot, ActionField,
     GameState, Action, ActionKind, AttackMode,
     PendingDecision, DecisionKind,
-    ActionContext, ActionStep,
+    ActionContext, ActionStep, EffectContext,
     ResolutionContext, RunningContext, ConsentRequest,
     RefreshContext,
     SlotRef, SlotKind,
@@ -94,6 +94,13 @@ def advance_action(state: GameState) -> GameState:
             return _step_voluntary_discard(state, ctx)
         case ActionStep.RESOLVE_FROM_DECK:
             return _step_resolve_from_deck(state, ctx)
+        case ActionStep.ATTACK_CHOICE:
+            return _step_attack_choice(state, ctx)
+        case ActionStep.EFFECT_DECISION:
+            # Waiting for player input — should have pending decision
+            raise RuntimeError("EFFECT_DECISION should have a pending decision")
+        case ActionStep.MUTINY:
+            return _step_mutiny(state, ctx)
         case ActionStep.NEXT_TURN:
             return _step_next_turn(state, ctx)
         case ActionStep.ELUSIVE_CLEANUP:
@@ -130,6 +137,11 @@ def apply_action_action(state: GameState, action: Action) -> GameState:
             return _apply_voluntary_discard(state, ctx, action)
         case ActionStep.RUNNING_DECIDE:
             return _apply_running_decide(state, ctx, action)
+        case ActionStep.ATTACK_CHOICE:
+            return _apply_attack_choice(state, ctx, action)
+        case ActionStep.EFFECT_DECISION:
+            from ..effects import resume_effect
+            return resume_effect(state, action)
         case _:
             raise RuntimeError(f"Cannot apply action in step: {ctx.step}")
 
@@ -270,10 +282,10 @@ def _apply_last_resort(state: GameState, ctx: ActionContext, action: Action) -> 
         ctx = replace(ctx, step=ActionStep.GUARDS)
         return gs_set_context(state, ctx)
 
-    elif idx == 2:  # Mutiny — stub for now (Stage 7/8)
+    elif idx == 2:  # Mutiny
         ctx = _set_last_resort_used(ctx, pid)
-        # TODO: Implement mutiny combat in Stage 7
-        return gs_set_context(state, replace(ctx, step=ActionStep.CHOOSE_SLOT))
+        ctx = replace(ctx, step=ActionStep.MUTINY)
+        return gs_set_context(state, ctx)
 
     raise RuntimeError(f"Unknown last resort index: {idx}")
 
@@ -488,6 +500,18 @@ def _step_choose_slot(state: GameState, ctx: ActionContext) -> GameState:
         descriptions.append(f"Discard: {cd.big_name or cd.name}")
         actions.append(vd)
 
+    # Cooperative win announcement (if player is Good and has world_killed ability)
+    ps = gs_get_player(state, pid)
+    if (ps.alignment == Alignment.GOOD
+            and "world_killed" in ps.permanent_abilities):
+        actions.append(Action(kind=ActionKind.SELECT_BOOL, flag=True))
+        descriptions.append("*** ANNOUNCE: Both Worlds are dead! (Cooperative win) ***")
+
+    # Temperance HP gift (if player has the ability)
+    if "temperance_give_hp" in ps.permanent_abilities and ps.hp > 1:
+        actions.append(Action(kind=ActionKind.SELECT_AMOUNT, amount=-1))
+        descriptions.append("Temperance: Give HP to the other player")
+
     decision = PendingDecision(
         player=pid,
         kind=DecisionKind.CHOOSE_ACTION_SLOT,
@@ -506,6 +530,14 @@ def _apply_choose_slot(state: GameState, ctx: ActionContext, action: Action) -> 
     # Handle voluntary discard
     if action.kind == ActionKind.SELECT_CARD:
         return _do_voluntary_discard(state, ctx, pid, action.card_id)
+
+    # Handle cooperative win announcement
+    if action.kind == ActionKind.SELECT_BOOL and action.flag:
+        return _handle_cooperative_win_announcement(state, ctx, pid)
+
+    # Handle Temperance HP gift
+    if action.kind == ActionKind.SELECT_AMOUNT and action.amount == -1:
+        return _begin_temperance_gift(state, ctx, pid)
 
     assert action.kind == ActionKind.SELECT_SLOT
     assert action.slot_ref is not None
@@ -532,6 +564,85 @@ def _apply_choose_slot(state: GameState, ctx: ActionContext, action: Action) -> 
 
     # No consent needed — proceed to resolution
     return _begin_slot_resolution(state, ctx, pid, slot_ref.owner, slot_ref.index)
+
+
+def _handle_cooperative_win_announcement(
+    state: GameState, ctx: ActionContext, pid: PlayerId
+) -> GameState:
+    """
+    Handle a cooperative win announcement. The announcing player declares
+    both Worlds are dead. If the OTHER player is also Good and also has
+    world_killed, the announcement succeeds. Otherwise, nothing happens
+    (the announcement is just a claim; the other player must also announce).
+
+    We track announcements and check if both players have announced.
+    """
+    ps = gs_get_player(state, pid)
+    ps = ps_add_permanent_ability(ps, "world_announced")
+    state = gs_update_player(state, pid, ps)
+
+    # Check if both players have announced
+    other_pid = pid.other()
+    other_ps = gs_get_player(state, other_pid)
+    if ("world_announced" in other_ps.permanent_abilities
+            and other_ps.alignment == Alignment.GOOD
+            and "world_killed" in other_ps.permanent_abilities):
+        # Both Good, both announced, both have killed Worlds — cooperative win!
+        from ..types import GameResult, GameResultKind
+        result = GameResult(
+            kind=GameResultKind.GOOD_COOPERATIVE_WIN,
+            winner=None,  # Both win
+            description="Both Good players have announced the death of both Worlds!",
+        )
+        from ..state_helpers import gs_set_result
+        return gs_set_result(state, result)
+
+    # Only one player has announced so far — continue play
+    # (stays in CHOOSE_SLOT, doesn't consume a play)
+    return state
+
+
+def _begin_temperance_gift(
+    state: GameState, ctx: ActionContext, pid: PlayerId
+) -> GameState:
+    """Begin Temperance HP gift: present amount choice."""
+    ps = gs_get_player(state, pid)
+    max_give = ps.hp - 1  # Must stay alive
+    if max_give <= 0:
+        return state  # Can't give anything
+
+    actions = tuple(
+        Action(kind=ActionKind.SELECT_AMOUNT, amount=i)
+        for i in range(1, max_give + 1)
+    )
+    decision = PendingDecision(
+        player=pid,
+        kind=DecisionKind.TEMPERANCE_GIVE_HP,
+        legal_actions=actions,
+        context_description=f"Temperance: Give 1–{max_give} HP to the other player.",
+    )
+    from ..effects import set_effect_decision
+    return set_effect_decision(state, "temperance_gift_action", 0, pid, decision)
+
+
+def _temperance_gift_resume(state, ectx, action):
+    """Resume Temperance gift — transfer HP."""
+    from ..combat import apply_damage, apply_healing, DamageSource, HealSource
+    resolver = ectx.resolver
+    amount = action.amount or 0
+    if amount > 0:
+        other = resolver.other()
+        state = apply_damage(state, resolver, amount, DamageSource.SELF_INFLICTED)
+        state = apply_healing(state, other, amount, HealSource.TEMPERANCE)
+    return state
+
+
+# Register the temperance gift resume handler
+def _register_temperance_gift():
+    from ..effects import RESUME_REGISTRY
+    RESUME_REGISTRY["temperance_gift_action"] = _temperance_gift_resume
+
+_register_temperance_gift()
 
 
 # ---------------------------------------------------------------------------
@@ -648,19 +759,24 @@ def _step_resolving_slot(state: GameState, ctx: ActionContext) -> GameState:
     # Resolve the card by type
     state = _resolve_card(state, ctx, pid, card_id, cd)
 
+    # Check if resolution set up a sub-decision (EFFECT_DECISION or ATTACK_CHOICE)
+    # If so, don't advance — let the decision be presented to the player
+    ctx_after = state.phase_context
+    if isinstance(ctx_after, ActionContext):
+        if ctx_after.step in (ActionStep.EFFECT_DECISION, ActionStep.ATTACK_CHOICE):
+            return state
+        if state.pending is not None:
+            return state
+
     # Check if player died during resolution
     ps = gs_get_player(state, pid)
     if ps.is_dead:
         ctx_new = state.phase_context
         if isinstance(ctx_new, ActionContext) and ctx_new.resolving:
-            # Return unresolved cards to the action field slot they came from
             res = ctx_new.resolving
             orphans: list[CardId] = []
-            # The current card: if it's an enemy and the player died, the enemy survives
-            # Check if the card was already placed somewhere by _resolve_card
             if res.current_card is not None and not _card_is_placed(state, pid, res.current_card):
                 orphans.append(res.current_card)
-            # Remaining queue cards
             for qc in res.card_queue:
                 if not _card_is_placed(state, pid, qc):
                     orphans.append(qc)
@@ -704,8 +820,25 @@ def _resolve_card(
     from ..effects import fire_on_resolve, fire_on_resolve_after, fire_on_kill, fire_after_death
     from ..combat import resolve_combat, get_attack_options, apply_damage, apply_healing
 
-    # 1. Fire ON_RESOLVE effects
-    state = fire_on_resolve(state, card_id, resolver)
+    # Check if ON_RESOLVE already fired (resuming from an effect decision)
+    skip_on_resolve = False
+    if isinstance(ctx, ActionContext) and ctx.resolving and ctx.resolving.on_resolve_done:
+        skip_on_resolve = True
+        # Clear the flag
+        new_res = replace(ctx.resolving, on_resolve_done=False)
+        ctx = replace(ctx, resolving=new_res)
+        state = gs_set_context(state, ctx)
+
+    # 1. Fire ON_RESOLVE effects (unless already done)
+    if not skip_on_resolve:
+        state = fire_on_resolve(state, card_id, resolver)
+
+    # Check if ON_RESOLVE set up an effect decision — if so, return immediately
+    # to let the decision be presented before default processing continues
+    ctx_check = state.phase_context
+    if isinstance(ctx_check, ActionContext):
+        if ctx_check.step == ActionStep.EFFECT_DECISION or state.pending is not None:
+            return state
 
     ps = gs_get_player(state, resolver)
     if ps.is_dead:
@@ -773,36 +906,58 @@ def _resolve_enemy(
     resolver: PlayerId, card_id: CardId, cd: CardDef
 ) -> GameState:
     """
-    Combat resolution using the combat module.
-    Fires ON_KILL and AFTER_DEATH triggers after successful kill.
-    Auto-selects attack mode (prefers weapon over fists).
+    Combat resolution: present ATTACK_CHOICE decision to the player.
+    The actual combat is resolved in _apply_attack_choice.
     """
-    from ..combat import resolve_combat, get_attack_options
-    from ..effects import fire_on_kill, fire_after_death
+    from ..combat import get_attack_options, _has_equipped_named
 
     options = get_attack_options(state, resolver, card_id)
 
-    # Auto-select: prefer weapon over fists
-    mode = "fists"
-    slot_idx = 0
-    for opt_mode, opt_idx in options:
-        if opt_mode != "fists":
-            mode = "weapon"
-            slot_idx = opt_idx
-            break
+    if len(options) == 1:
+        # Only fists — no choice needed, resolve directly
+        return _do_combat_and_triggers(state, resolver, card_id, cd, "fists", 0)
 
-    state = resolve_combat(state, resolver, card_id, mode, slot_idx)
+    # Present attack choice
+    actions: list[Action] = []
+    descs: list[str] = []
+    enemy_level = cd.level or 0
 
-    ps = gs_get_player(state, resolver)
-    if not ps.is_dead:
-        # Enemy was killed — fire triggers
-        state = fire_on_kill(state, card_id, resolver)
+    # Check Gobshite: if fists, level becomes 22
+    gobshite = (cd.name == "enemy_1")
 
-        # AFTER_DEATH for bosses — grants permanent ability
-        if CardType.BOSS in cd.card_types:
-            state = fire_after_death(state, card_id, resolver)
+    for mode, slot_idx in options:
+        if mode == "fists":
+            eff_level = 22 if gobshite else enemy_level
+            actions.append(Action(kind=ActionKind.SELECT_INDEX, index=len(actions)))
+            descs.append(f"Fists (take {eff_level} damage)")
+        else:
+            ps = gs_get_player(state, resolver)
+            ws = ps.weapon_slots[slot_idx]
+            weapon_cd = state.card_def(ws.weapon)
+            weapon_level = weapon_cd.level or 0
+            if _has_equipped_named(state, resolver, "major_4"):
+                weapon_level += 1
+            dmg = max(0, enemy_level - weapon_level)
+            label = mode.replace("_", " ").title()
+            actions.append(Action(kind=ActionKind.SELECT_INDEX, index=len(actions)))
+            descs.append(f"{label} Lv{weapon_cd.level} (take {dmg} damage)")
 
-    return state
+    card_name = cd.big_name or cd.name
+    decision = PendingDecision(
+        player=resolver,
+        kind=DecisionKind.CHOOSE_ATTACK_MODE,
+        legal_actions=tuple(actions),
+        context_description=(
+            f"Combat vs {card_name} Lv{enemy_level}:\n" +
+            "\n".join(f"  [{i}] {d}" for i, d in enumerate(descs))
+        ),
+    )
+    # Store attack options in context for resume
+    ctx = state.phase_context
+    assert isinstance(ctx, ActionContext)
+    ctx = replace(ctx, step=ActionStep.ATTACK_CHOICE, attack_target=card_id)
+    state = gs_set_context(state, ctx)
+    return gs_set_pending(state, decision)
 
 
 def _resolve_food(
@@ -854,6 +1009,148 @@ def _resolve_event(
     ps = replace(ps, discard_pile=ps.discard_pile + (card_id,))
     state = gs_update_player(state, resolver, ps)
     return state
+
+
+# ---------------------------------------------------------------------------
+# ATTACK_CHOICE
+# ---------------------------------------------------------------------------
+
+def _step_attack_choice(state: GameState, ctx: ActionContext) -> GameState:
+    """Present attack mode choice — should already have a pending decision."""
+    raise RuntimeError("ATTACK_CHOICE should have a pending decision from _resolve_enemy")
+
+
+def _apply_attack_choice(state: GameState, ctx: ActionContext, action: Action) -> GameState:
+    """Apply the player's attack mode choice."""
+    assert ctx.attack_target is not None
+    card_id = ctx.attack_target
+    cd = state.card_def(card_id)
+    pid = ctx.current_turn
+
+    from ..combat import get_attack_options
+    options = get_attack_options(state, pid, card_id)
+    choice_idx = action.index or 0
+
+    if choice_idx < len(options):
+        mode, slot_idx = options[choice_idx]
+    else:
+        mode, slot_idx = "fists", 0
+
+    # Clear attack target
+    ctx = replace(ctx, attack_target=None, step=ActionStep.RESOLVING_SLOT)
+    state = gs_set_context(state, ctx)
+
+    state = _do_combat_and_triggers(state, pid, card_id, cd, mode, slot_idx)
+
+    # Fire ON_RESOLVE_AFTER
+    from ..effects import fire_on_resolve_after
+    state = fire_on_resolve_after(state, card_id, pid)
+
+    # Advance past the current card in the resolution queue
+    return _advance_resolution_queue(state, pid)
+
+
+def _do_combat_and_triggers(
+    state: GameState, resolver: PlayerId,
+    card_id: CardId, cd: CardDef,
+    mode: str, slot_idx: int,
+) -> GameState:
+    """Execute combat and fire ON_KILL / AFTER_DEATH triggers."""
+    from ..combat import resolve_combat
+    from ..effects import fire_on_kill, fire_after_death
+
+    # Gobshite: level 22 if fists
+    effective_cd = cd
+    if cd.name == "enemy_1" and mode == "fists":
+        # Monkey-patch the effective level for combat
+        effective_cd = replace(cd, level=22)
+        # We can't actually replace the frozen CardDef in the registry,
+        # so pass the level directly to resolve_combat.
+        # For now, manually apply the damage:
+        from ..combat import apply_damage, DamageSource
+        state = apply_damage(state, resolver, 22, DamageSource.COMBAT)
+        ps = gs_get_player(state, resolver)
+        if not ps.is_dead:
+            ps = replace(ps, discard_pile=ps.discard_pile + (card_id,))
+            state = gs_update_player(state, resolver, ps)
+            state = fire_on_kill(state, card_id, resolver)
+        return state
+
+    state = resolve_combat(state, resolver, card_id, mode, slot_idx if slot_idx >= 0 else 0)
+
+    ps = gs_get_player(state, resolver)
+    if not ps.is_dead:
+        state = fire_on_kill(state, card_id, resolver)
+        if CardType.BOSS in cd.card_types:
+            state = fire_after_death(state, card_id, resolver)
+
+    return state
+
+
+def _advance_resolution_queue(state: GameState, pid: PlayerId) -> GameState:
+    """
+    Advance past the current card in the resolution queue after it's been resolved.
+    Handles death check, voluntary discard window, and play consumption.
+    """
+    ps = gs_get_player(state, pid)
+    ctx = state.phase_context
+    assert isinstance(ctx, ActionContext)
+
+    # Check for sub-decisions that were set during combat/effects
+    if ctx.step in (ActionStep.EFFECT_DECISION, ActionStep.ATTACK_CHOICE):
+        return state  # Still waiting for a decision
+    if state.pending is not None:
+        return state
+
+    if ps.is_dead:
+        if ctx.resolving:
+            res = ctx.resolving
+            orphans = []
+            # Check if current_card was already placed by combat
+            if res.current_card is not None and not _card_is_placed(state, pid, res.current_card):
+                # Also check the other player (enemy could have gone to their stuff)
+                other = pid.other()
+                if not _card_is_placed(state, other, res.current_card):
+                    orphans.append(res.current_card)
+            for qc in res.card_queue:
+                if not _card_is_placed(state, pid, qc) and not _card_is_placed(state, pid.other(), qc):
+                    orphans.append(qc)
+            if orphans:
+                af = state.action_field
+                for oid in orphans:
+                    af = af_add_card_to_slot(af, res.slot_owner, res.slot_index, oid, position="bottom")
+                state = gs_set_action_field(state, af)
+        ctx = state.phase_context
+        assert isinstance(ctx, ActionContext)
+        ctx = replace(ctx, resolving=None, step=ActionStep.NEXT_TURN)
+        return gs_set_context(state, ctx)
+
+    if ctx.resolving is not None and ctx.resolving.card_queue:
+        # More cards — offer voluntary discard window
+        # Advance: move queue[0] to current_card
+        res = ctx.resolving
+        new_res = replace(res, current_card=res.card_queue[0], card_queue=res.card_queue[1:],
+                          on_resolve_done=False)
+        ctx = replace(ctx, resolving=new_res, step=ActionStep.VOLUNTARY_DISCARD)
+        return gs_set_context(state, ctx)
+    else:
+        # No more cards — play is done
+        ctx = _consume_play(ctx, pid)
+        ctx = replace(ctx, resolving=None, step=ActionStep.NEXT_TURN)
+        return gs_set_context(state, ctx)
+
+
+# ---------------------------------------------------------------------------
+# MUTINY
+# ---------------------------------------------------------------------------
+
+def _step_mutiny(state: GameState, ctx: ActionContext) -> GameState:
+    """Execute Mutiny: attack the other player."""
+    from ..combat import resolve_mutiny
+    pid = ctx.current_turn
+    state = resolve_mutiny(state, pid)
+    ctx = replace(ctx, step=ActionStep.CHOOSE_SLOT)
+    return gs_set_context(state, ctx)
 
 
 # ---------------------------------------------------------------------------

@@ -610,7 +610,7 @@ def test_combat_through_action_phase():
     state = gs_set_action_field(state, af)
 
     # Set up action context
-    from fj_spec.phases.action import _begin_slot_resolution, _step_resolving_slot
+    from fj_spec.phases.action import _begin_slot_resolution, _step_resolving_slot, _apply_attack_choice
     ctx = ActionContext(current_turn=pid, step=ActionStep.RESOLVING_SLOT)
     state = replace(state, phase=Phase.ACTION, phase_context=ctx)
 
@@ -619,12 +619,22 @@ def test_combat_through_action_phase():
     ctx = state.phase_context
     assert isinstance(ctx, ActionContext)
 
-    # Step through resolution
+    # Step through resolution — now presents ATTACK_CHOICE decision
     state = _step_resolving_slot(state, ctx)
 
+    # Should have a pending ATTACK_CHOICE decision (weapon available)
+    if state.pending and state.pending.kind == DecisionKind.CHOOSE_ATTACK_MODE:
+        # Choose weapon (index 1, since fists is index 0)
+        weapon_action = state.pending.legal_actions[1]  # weapon option
+        from fj_spec.state_helpers import gs_set_pending
+        state = gs_set_pending(state, None)
+        state = _apply_attack_choice(state, state.phase_context, weapon_action)
+    else:
+        # Only fists available (shouldn't happen with weapon equipped)
+        pass
+
     ps = gs_get_player(state, pid)
-    # Should have used weapon (auto-selects weapon over fists)
-    # Level-6 weapon vs level-3 enemy: 0 damage
+    # Level-6 weapon vs level-2 enemy: 0 damage
     assert ps.hp == 20
 
     # Enemy should be in kill pile (weapon kill)
@@ -634,7 +644,7 @@ def test_combat_through_action_phase():
             found_in_kill = True
     assert found_in_kill, "Enemy should be in kill pile after weapon kill"
 
-    print("  Combat through action phase: weapon auto-selected, enemy in kill pile")
+    print("  Combat through action phase: weapon chosen via decision, enemy in kill pile")
     print("  PASS")
 
 

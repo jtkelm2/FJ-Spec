@@ -189,6 +189,20 @@ def prompt_decision(state: GameState, decision: PendingDecision) -> Action:
             return _prompt_recycle(state, decision)
         case DecisionKind.VOLUNTARY_DISCARD:
             return _prompt_voluntary_discard(state, decision)
+        case DecisionKind.CHOOSE_ATTACK_MODE:
+            return _prompt_generic(state, decision)
+        case DecisionKind.MAGICIAN_CHOOSE:
+            return _prompt_card_choice(state, decision)
+        case DecisionKind.HERMIT_CHOOSE:
+            return _prompt_yes_no(state, decision)
+        case DecisionKind.LOVERS_CHOOSE_HP:
+            return _prompt_amount(state, decision)
+        case DecisionKind.SALTINE_CHOICE:
+            return _prompt_generic(state, decision)
+        case DecisionKind.TEMPERANCE_GIVE_HP:
+            return _prompt_amount(state, decision)
+        case DecisionKind.STRENGTH_DECLARE_D20:
+            return _prompt_amount(state, decision)
         case _:
             return _prompt_generic(state, decision)
 
@@ -479,6 +493,41 @@ def _describe_action_short(state, action):
     if action.kind == ActionKind.DECLINE:
         return "Pass / decline"
     return " | ".join(parts)
+
+
+def _prompt_card_choice(state, decision):
+    """Prompt to choose a card from visible_cards."""
+    cards = decision.visible_cards or ()
+    for i, cid in enumerate(cards):
+        print(f"  [{i}] {_card_short(state, cid)}")
+    idx = _read_int("Choice", 0, len(decision.legal_actions) - 1)
+    return decision.legal_actions[idx]
+
+
+def _prompt_yes_no(state, decision):
+    """Prompt for a yes/no decision."""
+    print("  [y] Yes  [n] No")
+    while True:
+        raw = input("  Choice: ").strip().lower()
+        if raw in ('y', 'yes', '1', 'true'):
+            return Action(kind=ActionKind.SELECT_BOOL, flag=True)
+        if raw in ('n', 'no', '0', 'false'):
+            return Action(kind=ActionKind.SELECT_BOOL, flag=False)
+        print("  Enter 'y' or 'n'.")
+
+
+def _prompt_amount(state, decision):
+    """Prompt for a numeric amount from the legal actions."""
+    amounts = [a.amount for a in decision.legal_actions if a.amount is not None]
+    if not amounts:
+        return decision.legal_actions[0]
+    lo, hi = min(amounts), max(amounts)
+    val = _read_int("Amount", lo, hi)
+    # Find matching action
+    for a in decision.legal_actions:
+        if a.amount == val:
+            return a
+    return decision.legal_actions[0]
 
 
 # ---------------------------------------------------------------------------

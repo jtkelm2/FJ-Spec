@@ -38,10 +38,34 @@ def auto_choose(state: GameState, decision: PendingDecision) -> Action:
         case DecisionKind.GRANT_CONSENT:
             return Action(kind=ActionKind.SELECT_BOOL, flag=True)
         case DecisionKind.VOLUNTARY_DISCARD:
-            return Action(kind=ActionKind.DECLINE)
+            # Decline unless it's a yes/no from an effect (Piñata, Saltine eat)
+            decline = [a for a in decision.legal_actions if a.kind == ActionKind.DECLINE]
+            if decline:
+                return decline[0]
+            # Yes/no: pick False (decline)
+            no_actions = [a for a in decision.legal_actions if a.kind == ActionKind.SELECT_BOOL and not a.flag]
+            return no_actions[0] if no_actions else decision.legal_actions[0]
         case DecisionKind.RECYCLE_DECISION:
             n = len(decision.visible_cards) if decision.visible_cards else 4
             return Action(kind=ActionKind.SELECT_RECYCLE, recycle_flags=tuple([False] * n))
+        case DecisionKind.CHOOSE_ATTACK_MODE:
+            return decision.legal_actions[0]  # Pick first option (fists or weapon)
+        case DecisionKind.MAGICIAN_CHOOSE:
+            return decision.legal_actions[0]
+        case DecisionKind.HIGH_PRIESTESS_NAME:
+            return Action(kind=ActionKind.DECLINE)  # Skip naming
+        case DecisionKind.HERMIT_CHOOSE:
+            return Action(kind=ActionKind.SELECT_BOOL, flag=False)  # Don't give HP
+        case DecisionKind.LOVERS_CHOOSE_HP:
+            return Action(kind=ActionKind.SELECT_AMOUNT, amount=0)  # Give 0
+        case DecisionKind.SALTINE_CHOICE:
+            return Action(kind=ActionKind.SELECT_INDEX, index=0)  # Eat as food
+        case DecisionKind.HIEROPHANT_SPLIT:
+            return decision.legal_actions[0]  # First split
+        case DecisionKind.STRENGTH_DECLARE_D20:
+            return Action(kind=ActionKind.SELECT_AMOUNT, amount=11)  # Honest roll > 10
+        case DecisionKind.TEMPERANCE_GIVE_HP:
+            return decision.legal_actions[0]  # Give minimum
         case _:
             return decision.legal_actions[0]
 
@@ -170,6 +194,11 @@ def test_auto_game_card_conservation():
             if ctx.resolving.current_card is not None:
                 total += 1
             total += len(ctx.resolving.card_queue)
+        # Also count attack_target if set (card removed from slot, pending combat choice)
+        if isinstance(ctx, ActionContext) and ctx.attack_target is not None:
+            # Only count if not already counted in resolving.current_card
+            if not (ctx.resolving and ctx.resolving.current_card == ctx.attack_target):
+                total += 1
 
         assert total == expected, (
             f"Card conservation failed at seed={seed}: expected {expected}, got {total}"
